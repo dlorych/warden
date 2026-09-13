@@ -1,0 +1,29 @@
+{
+  "name": "service",
+  "version": "1.0.0",
+  "description": "Warden is a deployment approval service. The local stack runs the Go service, PostgreSQL, Keycloak, the real Rekor v2 POSIX filesystem log, and a stateful GitHub App/API mock. The React browser UI is served by Warden at `http://localhost:8080`.",
+  "main": "index.js",
+  "scripts": {
+    "prepare": "husky",
+    "typecheck": "cd web && npx tsc -b",
+    "test": "go test ./...",
+    "lint:markdown": "markdownlint-cli2 '**/*.md' '#node_modules/**' '#web/node_modules/**' '#.agents/**'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dlorych/warden.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/dlorych/warden/issues"
+  },
+  "homepage": "https://github.com/dlorych/warden#readme",
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.5.1",
+    "markdownlint-cli2": "^0.23.2",
+    "prettier": "^3.9.6"
+  }
+}

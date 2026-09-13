@@ -1,0 +1,6 @@
+{
+  "{AGENTS.md,README.md}": "prettier --ignore-unknown --check",
+  "docs/**/*.md": "prettier --ignore-unknown --check",
+  "web/**/*.{js,jsx,ts,tsx,json,css,scss}": "prettier --ignore-unknown --check",
+  "{package.json,package-lock.json,*.yml,*.yaml}": "prettier --ignore-unknown --check"
+}
