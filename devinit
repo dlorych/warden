@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT"
+if [ ! -f .dev/app-key.pem ] || [ ! -f .dev/rekor-signer.key ] || [ ! -f .dev/ca.pem ]; then
+  go run ./cmd/devinit --dir .dev
+fi
+umask 077
+compose_env=.dev/compose.env
+public_tmp=.dev/app-public.pem.tmp.$$
+openssl rsa -in .dev/app-key.pem -pubout -out "$public_tmp" 2>/dev/null
+chmod 0644 "$public_tmp"
+mv "$public_tmp" .dev/app-public.pem
+if [ ! -f "$compose_env" ]; then
+  session_secret=$(openssl rand -base64 32 | tr -d '\n')
+  webhook_secret=$(openssl rand -hex 24)
+  {
+    printf '%s\n' "SESSION_SECRET=$session_secret"
+    printf '%s\n' "GITHUB_WEBHOOK_SECRET=$webhook_secret"
+    printf '%s\n' "GITHUB_APP_ID=12345"
+  } > "$compose_env"
+elif grep -qE '^GITHUB_APP_(PRIVATE|PUBLIC)_KEY=' "$compose_env"; then
+  migrated="$compose_env.migrated.$$"
+  awk '!/^GITHUB_APP_PRIVATE_KEY=/{if ($0 !~ /^GITHUB_APP_PUBLIC_KEY=/) print}' "$compose_env" > "$migrated"
+  mv "$migrated" "$compose_env"
+fi
+echo "Warden development material is ready in .dev/"
+echo "Browser: http://localhost:8080   Keycloak: http://localhost:8180"
+echo "Users: requester/requester-dev-password, reviewer/reviewer-dev-password"

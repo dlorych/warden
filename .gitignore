@@ -1,0 +1,10 @@
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+bin/
+dev/rekor-data/
+dev/rekor/pki/
+dev/rekor/witness/
+.dev/
+.env
+*.log

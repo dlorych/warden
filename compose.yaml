@@ -1,0 +1,91 @@
+name: warden
+services:
+  postgres:
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    environment:
+      POSTGRES_DB: warden
+      POSTGRES_USER: warden
+      POSTGRES_PASSWORD: warden-dev-password
+    volumes: [warden_pg:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U warden -d warden"], interval: 3s, timeout: 3s, retries: 20}
+
+  keycloak:
+    image: keycloak/keycloak:26.3.3@sha256:6a7217a100bd3e5de4063a27a538ef999a3c5a88c4b4ec0ffc0a642aee7b2597
+    command: ["start-dev", "--import-realm", "--http-port=8080", "--hostname=http://localhost:8180", "--http-relative-path=/"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin-dev-password
+      KC_HEALTH_ENABLED: "true"
+    volumes: [./dev/keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro]
+    ports: ["8180:8080"]
+    healthcheck: {test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080"], interval: 5s, timeout: 3s, retries: 30}
+
+  rekor:
+    build:
+      context: https://github.com/sigstore/rekor-tiles.git#c06aa15aacb950ee610bccbfcda289c2abea1f8c
+      target: local-deploy
+      args: {STORAGE_BACKEND: posix}
+    command: ["rekor-server", "serve", "--http-address=0.0.0.0", "--grpc-address=0.0.0.0", "--hostname=rekor-local", "--storage-dir=/tmp/posixlog", "--signer-filepath=/dev-material/rekor-signer.key", "--checkpoint-interval=2s", "--log-level=info", "--persistent-antispam=true"]
+    volumes:
+      - ./.dev/rekor-signer.key:/dev-material/rekor-signer.key:ro
+      - rekor_storage:/tmp/posixlog
+    ports: ["3003:3000"]
+    depends_on: {nginx: {condition: service_healthy}}
+    healthcheck: {test: ["CMD-SHELL", "curl --fail http://localhost:3000/healthz | grep -q SERVING"], interval: 5s, timeout: 5s, retries: 30}
+
+  nginx:
+    image: nginx:1.31.5@sha256:05b8cb60c354a44ab824ea6e7dc69b46d50762cdbe728a347a5b656e6fb3d7c4
+    volumes: [rekor_storage:/usr/share/nginx/html:ro]
+    healthcheck: {test: ["CMD-SHELL", "nginx -t"], interval: 5s, timeout: 3s, retries: 30}
+
+  githubmock:
+    build: {context: ., dockerfile: dev/githubmock.Dockerfile}
+    environment:
+      ADDR: ":8090"
+      BACKEND_WEBHOOK_URL: http://warden:8080/webhooks/github
+      GITHUB_PUBLIC_URL: http://githubmock:8090
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-local-webhook-secret}
+      GITHUB_APP_PUBLIC_KEY_FILE: /run/githubmock/app-public.pem
+    volumes:
+      - ./.dev/app-public.pem:/run/githubmock/app-public.pem:ro
+    ports: ["8090:8090"]
+    healthcheck: {test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090'"], interval: 3s, timeout: 3s, retries: 20}
+
+  warden:
+    build: .
+    environment:
+      ADDR: ":8080"
+      DATABASE_URL: postgres://warden:warden-dev-password@postgres:5432/warden?sslmode=disable
+      PUBLIC_URL: http://localhost:8080
+      WEB_URL: http://localhost:8080
+      OIDC_ISSUER: http://localhost:8180/realms/warden
+      OIDC_INTERNAL_BASE_URL: http://keycloak:8080
+      OIDC_CLIENT_ID: warden-bff
+      OIDC_CLIENT_SECRET: warden-bff-dev-secret
+      OIDC_REDIRECT_URL: http://localhost:8080/bff/callback
+      OIDC_POST_LOGOUT_REDIRECT_URL: http://localhost:8080/
+      OIDC_AUDIENCE: warden-cli
+      GITHUB_API_BASE_URL: http://githubmock:8090
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-local-webhook-secret}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-12345}
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/warden-secrets/app-key.pem
+      REKOR_URL: http://rekor:3000
+      REKOR_CHECKPOINT_PUBLIC_KEY_FILE: /run/warden-trust/rekor-public.pem
+      EVIDENCE_TRUST_FILE: /run/warden-trust/ca.pem
+      SESSION_SECRET: ${SESSION_SECRET:-warden-local-session-secret-please-change-32}
+      WEB_DIST: /app/web/dist
+    ports: ["8080:8080"]
+    volumes:
+      - ./.dev/app-key.pem:/run/warden-secrets/app-key.pem:ro
+      - ./.dev/rekor-public.pem:/run/warden-trust/rekor-public.pem:ro
+      - ./.dev/ca.pem:/run/warden-trust/ca.pem:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      keycloak: {condition: service_healthy}
+      githubmock: {condition: service_healthy}
+      rekor: {condition: service_healthy}
+    healthcheck: {test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'"], interval: 5s, timeout: 3s, retries: 30}
+
+volumes:
+  warden_pg: {}
+  rekor_storage: {}
