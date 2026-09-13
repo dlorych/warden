@@ -111,13 +111,24 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	// Local invalidation is complete before constructing the provider redirect.
 	// If discovery or the provider lacks RP-initiated logout, the user is still
 	// logged out of Warden and the browser will simply reload the login screen.
-	if a.Auth != nil {
-		if logoutURL, err := a.Auth.RPInitiatedLogoutURL(a.Config.OIDCPostLogoutRedirectURL); err == nil {
-			writeJSON(w, http.StatusOK, map[string]string{"logoutURL": logoutURL})
-			return
-		}
+	if logoutURL := a.oidcLogoutURL(r.Context()); logoutURL != "" {
+		writeJSON(w, http.StatusOK, map[string]string{"logoutURL": logoutURL})
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"loggedOut": true})
+}
+
+func (a *App) oidcLogoutURL(ctx context.Context) string {
+	if a.Auth != nil {
+		// Discovery is deliberately refreshed here because the BFF may have
+		// restarted since the browser session was created. Local invalidation
+		// happens before this network call in logout.
+		_ = a.Auth.Discovery(ctx)
+		if logoutURL, err := a.Auth.RPInitiatedLogoutURL(a.Config.OIDCPostLogoutRedirectURL); err == nil {
+			return logoutURL
+		}
+	}
+	return ""
 }
 func (a *App) requireBrowser(w http.ResponseWriter, r *http.Request) (store.Session, bool) {
 	s, e := a.currentSession(r)
@@ -221,6 +232,31 @@ func (a *App) bffEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"items": d})
+}
+
+// publicEvidence serves the exact bundle committed after Rekor inclusion.
+// It intentionally has no authentication boundary: the callback reference is
+// useful to GitHub users and external auditors. Before publication, the
+// decision is indistinguishable from a missing record at this endpoint.
+func (a *App) publicEvidence(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, e := uuid.Parse(id); e != nil {
+		writeProblem(w, 404, "Evidence not found")
+		return
+	}
+	bundle, found, e := a.Store.PublishedEvidence(r.Context(), id)
+	if e != nil {
+		writeProblem(w, 500, "Could not read evidence")
+		return
+	}
+	if !found {
+		writeProblem(w, 404, "Evidence not found")
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(bundle)
 }
 
 type decisionDTO struct {

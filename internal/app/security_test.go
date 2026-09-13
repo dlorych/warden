@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"github.com/wardenv/service/internal/auth"
 	"github.com/wardenv/service/internal/source"
 	"github.com/wardenv/service/pkg/evidence"
 	"net/http"
@@ -38,6 +41,39 @@ func TestNoStoreMiddleware(t *testing.T) {
 		t.Fatalf("cache header=%q", rr.Header().Get("Cache-Control"))
 	}
 }
+
+func TestDecisionCommentUsesStablePublicEvidenceURL(t *testing.T) {
+	a := &App{Config: Config{PublicURL: "https://warden.example/"}}
+	want := "Warden decision recorded. Evidence: https://warden.example/evidence/11111111-1111-4111-8111-111111111111"
+	if got := a.decisionComment("11111111-1111-4111-8111-111111111111"); got != want {
+		t.Fatalf("comment = %q, want %q", got, want)
+	}
+}
+
+func TestOIDCLogoutURLRefreshesDiscoveryOnDemand(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":               "http://" + r.Host,
+			"end_session_endpoint": "http://" + r.Host + "/logout",
+		})
+	}))
+	defer server.Close()
+
+	a := &App{
+		Auth:   auth.New(auth.Config{OIDCIssuer: server.URL, OIDCClientID: "warden-bff"}),
+		Config: Config{OIDCPostLogoutRedirectURL: "http://localhost:8080/"},
+	}
+	got := a.oidcLogoutURL(t.Context())
+	want := fmt.Sprintf("%s/logout?client_id=warden-bff&post_logout_redirect_uri=http%%3A%%2F%%2Flocalhost%%3A8080%%2F", server.URL)
+	if got != want {
+		t.Fatalf("logout URL=%q want %q", got, want)
+	}
+}
+
 func TestEvidenceCertificateRequiresConfiguredTrustAndSubject(t *testing.T) {
 	now := time.Now()
 	cak, cac, capem, _, err := evidence.NewDevCA(now)

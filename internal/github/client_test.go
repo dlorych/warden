@@ -77,6 +77,7 @@ func TestAdapterContextRoundTrip(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	var runCalls atomic.Int32
 	var callbackCalls atomic.Int32
+	var callbackComment string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/app/installations/9/access_tokens" {
 			json.NewEncoder(w).Encode(map[string]any{"token": "tok", "expires_at": "2099-01-01T00:00:00Z"})
@@ -89,6 +90,11 @@ func TestAdapterContextRoundTrip(t *testing.T) {
 		}
 		if r.URL.Path == "/repos/o/r/actions/runs/77/deployment_protection_rule" {
 			callbackCalls.Add(1)
+			var in map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				t.Errorf("decode callback: %v", err)
+			}
+			callbackComment = in["comment"]
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -117,5 +123,8 @@ func TestAdapterContextRoundTrip(t *testing.T) {
 	}
 	if runCalls.Load() != 2 || callbackCalls.Load() != 1 {
 		t.Fatalf("calls run=%d callback=%d", runCalls.Load(), callbackCalls.Load())
+	}
+	if callbackComment != "ok" {
+		t.Fatalf("callback comment = %q, want %q", callbackComment, "ok")
 	}
 }

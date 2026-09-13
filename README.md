@@ -37,7 +37,9 @@ Run the decision flow with the request ID from `make demo-request`:
 
 The CLI opens the real Keycloak authorization page. Authenticate as `reviewer`, then return to the terminal and answer the decision and reason prompts. The CLI uses the public `warden-cli` client, authorization-code PKCE, and the loopback callback `http://127.0.0.1:18765/callback`. It loads the development reviewer certificate and signing key from `.dev/reviewer.pem` and `.dev/reviewer-key.pem`.
 
-The CLI first fetches the request, asks Warden for a one-time challenge bound to the displayed context, checks the returned statement against the request, decision, reason, and certificate identity, signs it, and submits the certificate-backed bundle. Warden verifies the signature and certificate, records the decision, submits the signed statement to Rekor, verifies the inclusion proof, and only then sends the approved or rejected callback to GitHub.
+The CLI first fetches the request, asks Warden for a one-time challenge bound to the displayed context, checks the returned statement against the request, decision, reason, and certificate identity, signs it, and submits the certificate-backed bundle. Warden verifies the signature and certificate, records the decision, submits the signed statement to Rekor, verifies the inclusion proof, and only then sends the approved or rejected callback to GitHub. The callback comment includes a stable public link such as `http://localhost:8080/evidence/<request-id>`.
+
+The public evidence link serves the complete immutable bundle only after publication succeeds; before that, and for an unknown request, it returns 404. It contains the signed decision, certificate chain, Rekor record, and inclusion proof and can be verified offline with `warden verify`. The link points to Warden's bundle instead of a raw Rekor log URL because Warden's bundle carries the complete request decision evidence in a portable form while Rekor remains the transparency anchor.
 
 Poll the mock for the callback outcome:
 
@@ -62,9 +64,13 @@ Verify the bundle offline against the generated CA and Rekor checkpoint key. Thi
 ./bin/warden verify <request-id>.bundle.json --trust .dev/trust.json
 ```
 
+The same published bundle is available without authentication at
+`http://localhost:8080/evidence/<request-id>`, which is the URL included in
+the GitHub callback comment. Pending or unknown requests return `404`.
+
 ## Authentication and local controls
 
-The browser uses the confidential `warden-bff` client and PKCE. Its BFF endpoints use an HttpOnly same-origin session cookie; logout requires the CSRF token returned by `/bff/session`. Logout first deletes the Warden session and expires the browser cookie, then the BFF returns a server-generated RP-initiated logout URL. The browser follows that URL to Keycloak, which clears the Keycloak SSO session and redirects to the configured local root. The post-logout redirect is fixed in configuration and allowlisted on the Keycloak client; it is never accepted from a browser request. If the provider's logout metadata is unavailable, Warden still completes local logout and reloads the sign-in page. The browser never receives or stores an OIDC access token or ID token. The CLI uses a bearer access token with the `warden:decide` scope for the decision and evidence API, and signs the decision with the user certificate. Browser and CLI credentials are deliberately separate paths.
+The browser uses the confidential `warden-bff` client and PKCE. Its BFF endpoints use an HttpOnly same-origin session cookie; logout requires the CSRF token returned by `/bff/session`. Logout first deletes the Warden session and expires the browser cookie, then the BFF returns a server-generated RP-initiated logout URL. The browser follows that URL to Keycloak, which clears the Keycloak SSO session and redirects to the configured local root. A provider may show a logout confirmation page because this MVP uses the client-ID form without retaining an ID token hint. The post-logout redirect is fixed in configuration and allowlisted on the Keycloak client; it is never accepted from a browser request. If the provider's logout metadata is unavailable, Warden still completes local logout and reloads the sign-in page. The browser never receives or stores an OIDC access token or ID token. The CLI uses a bearer access token with the `warden:decide` scope for the decision and evidence API, and signs the decision with the user certificate. Browser and CLI credentials are deliberately separate paths.
 
 The mock sends a signed `deployment_protection_rule` webhook to Warden. Its development controls are useful for exercising source-state handling and retries:
 

@@ -12,6 +12,8 @@ import (
 	"github.com/wardenv/service/internal/source"
 	"github.com/wardenv/service/internal/store"
 	"github.com/wardenv/service/pkg/evidence"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -111,6 +113,15 @@ func (a *App) publish(ctx context.Context, j store.Job) error {
 	}
 	return a.deliver(ctx, req)
 }
+
+func (a *App) evidenceURL(requestID string) string {
+	return strings.TrimRight(a.Config.PublicURL, "/") + "/evidence/" + url.PathEscape(requestID)
+}
+
+func (a *App) decisionComment(requestID string) string {
+	return "Warden decision recorded. Evidence: " + a.evidenceURL(requestID)
+}
+
 func (a *App) deliver(ctx context.Context, req store.Request) error {
 	if time.Now().After(req.ExpiresAt) {
 		return a.Store.SetStatuses(ctx, req.ID, "", "expired")
@@ -125,7 +136,7 @@ func (a *App) deliver(ctx context.Context, req store.Request) error {
 	if req.Decision == "approved" {
 		state = "approved"
 	}
-	if e := a.Source.Deliver(ctx, event, state, "Warden decision recorded"); e != nil {
+	if e := a.Source.Deliver(ctx, event, state, a.decisionComment(req.ID)); e != nil {
 		return e
 	}
 	return a.Store.SetStatuses(ctx, req.ID, "", "delivered")

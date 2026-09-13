@@ -157,6 +157,21 @@ func (s *Store) SavePublishedAndMark(ctx context.Context, requestID string, bund
 	}
 	return tx.Commit(ctx)
 }
+
+// PublishedEvidence returns the complete immutable evidence bundle only after
+// publication has been committed. Pending decisions deliberately have no
+// public representation here.
+func (s *Store) PublishedEvidence(ctx context.Context, requestID string) ([]byte, bool, error) {
+	var bundle []byte
+	err := s.db.QueryRow(ctx, `SELECT d.published_bundle FROM decisions d JOIN requests r ON r.id=d.request_id WHERE d.request_id=$1 AND r.log_status='published' AND d.published_bundle IS NOT NULL`, requestID).Scan(&bundle)
+	if err == pgx.ErrNoRows || len(bundle) == 0 {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return bundle, true, nil
+}
 func (s *Store) CreateChallenge(ctx context.Context, requestID, subject, decision, reason, nonceHash string, expires time.Time) error {
 	_, e := s.db.Exec(ctx, `INSERT INTO challenges(nonce_hash,request_id,subject,decision,reason,expires_at) VALUES($1,$2,$3,$4,$5,$6)`, nonceHash, requestID, subject, decision, reason, expires)
 	return e

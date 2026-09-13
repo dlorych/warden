@@ -51,6 +51,7 @@ func (a *App) Router() http.Handler {
 	r.Mount("/bff", a.bffRouter())
 	r.Mount("/api/v1", a.apiRouter())
 	r.Post("/webhooks/github", a.githubWebhook)
+	r.Get("/evidence/{id}", a.publicEvidence)
 	if dist := os.Getenv("WEB_DIST"); dist != "" {
 		files := http.FileServer(http.Dir(dist))
 		r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

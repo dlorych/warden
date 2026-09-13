@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,5 +122,22 @@ func TestWorkflowRunTargetsRunAndReportsCancellation(t *testing.T) {
 	}
 	if run["head_sha"] == "one" {
 		t.Fatal("run lookup fell back to another request")
+	}
+}
+
+func TestCallbackStoresEvidenceComment(t *testing.T) {
+	s := testServer()
+	x := s.newRequest(createInput{Repository: "acme/example"})
+	s.requests[x.ID] = x
+	s.tokens["ghs_test"] = time.Now().Add(time.Hour)
+	req := httptest.NewRequest(http.MethodPost, "/repos/acme/example/actions/runs/"+strconv.FormatInt(x.RunID, 10)+"/deployment_protection_rule", strings.NewReader(`{"state":"approved","environment_name":"production","comment":"Warden decision recorded. Evidence: http://localhost:8080/evidence/abc"}`))
+	req.Header.Set("Authorization", "Bearer ghs_test")
+	rec := httptest.NewRecorder()
+	s.githubAPI(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if x.CallbackComment == "" || !strings.Contains(x.CallbackComment, "/evidence/abc") {
+		t.Fatalf("callback comment = %q", x.CallbackComment)
 	}
 }

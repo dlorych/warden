@@ -15,6 +15,10 @@ returns the current user and CSRF token. Browser reads such as
 give the browser an OIDC access token. Browser writes, including
 `/bff/logout`, require the session CSRF token and origin checks.
 
+`GET /evidence/{request-id}` is a public, immutable read path for the
+published evidence bundle referenced by source callbacks. It is deliberately
+separate from the authenticated BFF and bearer CLI APIs.
+
 Logout has two coordinated parts. The BFF deletes its server-side session and
 expires the session cookie first. It then constructs an RP-initiated logout
 URL from the `end_session_endpoint` in the issuer's discovery document, using
@@ -23,8 +27,10 @@ navigates to that URL so Keycloak can clear its SSO cookie before redirecting
 back to Warden. Warden does not retain an ID token merely to use as an
 `id_token_hint`; Keycloak accepts the client-ID form of the request. If
 discovery does not provide an end-session endpoint, local logout remains
-successful and the client returns to the sign-in screen. The redirect is an
-operator-configured value and must also be allowlisted by the IdP client.
+successful and the client returns to the sign-in screen. An IdP may show a
+logout confirmation page for a client-ID-only request; that is provider UI,
+and the browser can complete it before returning to Warden. The redirect is
+an operator-configured value and must also be allowlisted by the IdP client.
 
 The CLI uses a separate bearer boundary. `warden decide` and `warden evidence
 download` use the OIDC public `warden-cli` client, authorization-code PKCE,
@@ -60,7 +66,7 @@ sequenceDiagram
     W->>DB: consume nonce, record decision, enqueue publish job
     W->>DB: worker claims publish job
     W->>R: submit hashedrekord and verify proof/checkpoint
-    W->>GH: recheck source, then deliver callback
+    W->>GH: recheck source, then deliver callback with evidence link
 ```
 
 ## Source boundary
@@ -100,6 +106,17 @@ that timestamp.
 The worker stores the published bundle and marks the request published before
 calling the source adapter's delivery callback. A delivery retry reuses that
 durable publication marker and does not submit another Rekor entry.
+
+The GitHub callback comment includes a stable public URL such as
+`https://warden.example/evidence/{request-id}`. The endpoint returns the exact
+immutable bundle only after Rekor inclusion has been verified; pending or
+missing requests return 404. The bundle contains the signed decision,
+certificate chain, Rekor entry data, and inclusion proof, so an auditor can
+verify it offline. The callback links to Warden's complete evidence bundle
+rather than a raw Rekor URL because Rekor is the transparency anchor while
+Warden's bundle binds that log entry to the request and decision in one
+portable artifact. The source adapter receives the same deterministic comment
+on retries.
 
 ## Durability and failure handling
 

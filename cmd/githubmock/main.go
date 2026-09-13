@@ -25,23 +25,24 @@ import (
 )
 
 type Request struct {
-	ID             string    `json:"id"`
-	Repository     string    `json:"repository"`
-	Environment    string    `json:"environment"`
-	CommitSHA      string    `json:"commit_sha"`
-	Requester      string    `json:"requester"`
-	CreatedAt      time.Time `json:"created_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	Decision       string    `json:"decision"`
-	Outcome        string    `json:"outcome"`
-	DeliveryStatus string    `json:"delivery_status"`
-	LogStatus      string    `json:"log_status"`
-	Reason         string    `json:"reason,omitempty"`
-	Owner          string    `json:"owner"`
-	Repo           string    `json:"repo"`
-	DeploymentID   int64     `json:"deployment_id"`
-	RunID          int64     `json:"run_id"`
-	InstallationID int64     `json:"installation_id"`
+	ID              string    `json:"id"`
+	Repository      string    `json:"repository"`
+	Environment     string    `json:"environment"`
+	CommitSHA       string    `json:"commit_sha"`
+	Requester       string    `json:"requester"`
+	CreatedAt       time.Time `json:"created_at"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	Decision        string    `json:"decision"`
+	Outcome         string    `json:"outcome"`
+	DeliveryStatus  string    `json:"delivery_status"`
+	LogStatus       string    `json:"log_status"`
+	CallbackComment string    `json:"callback_comment,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	Owner           string    `json:"owner"`
+	Repo            string    `json:"repo"`
+	DeploymentID    int64     `json:"deployment_id"`
+	RunID           int64     `json:"run_id"`
+	InstallationID  int64     `json:"installation_id"`
 }
 type createInput struct {
 	Repository  string `json:"repository"`
@@ -424,6 +425,7 @@ func (s *server) githubAPI(w http.ResponseWriter, r *http.Request) {
 			target.Decision = in.State
 			target.Outcome = in.State
 			target.DeliveryStatus = "delivered"
+			target.CallbackComment = in.Comment
 			s.mu.Unlock()
 			jsonOut(w, 202, map[string]any{"id": target.RunID, "state": in.State, "environment": in.Environment, "comment": in.Comment})
 			return

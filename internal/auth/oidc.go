@@ -52,13 +52,22 @@ func (s *Service) Discovery(ctx context.Context) error {
 	if res.StatusCode != 200 {
 		return fmt.Errorf("oidc discovery: %s", res.Status)
 	}
-	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&s.meta); e != nil {
+	var md metadata
+	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&md); e != nil {
 		return e
 	}
-	if s.meta.Issuer == "" || strings.TrimRight(s.meta.Issuer, "/") != s.cfg.OIDCIssuer {
+	if md.Issuer == "" || strings.TrimRight(md.Issuer, "/") != s.cfg.OIDCIssuer {
 		return fmt.Errorf("oidc issuer mismatch")
 	}
+	s.mu.Lock()
+	s.meta = md
+	s.mu.Unlock()
 	return nil
+}
+func (s *Service) metadata() metadata {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.meta
 }
 func (s *Service) transportURL(raw string) string {
 	if s.cfg.OIDCInternalBaseURL == "" {
@@ -77,8 +86,9 @@ func (s *Service) transportURL(raw string) string {
 	return u.String()
 }
 func (s *Service) AuthorizationURL(state, verifier, nonce string) string {
+	md := s.metadata()
 	q := url.Values{"response_type": {"code"}, "client_id": {s.cfg.OIDCClientID}, "redirect_uri": {s.cfg.OIDCRedirectURL}, "scope": {"openid profile email groups"}, "state": {state}, "nonce": {nonce}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"}, "audience": {s.cfg.OIDCAudience}}
-	return s.meta.AuthorizationEndpoint + "?" + q.Encode()
+	return md.AuthorizationEndpoint + "?" + q.Encode()
 }
 
 // RPInitiatedLogoutURL returns the provider's RP-initiated logout URL. The
@@ -89,10 +99,11 @@ func (s *Service) AuthorizationURL(state, verifier, nonce string) string {
 // client_id-only logout request, and avoiding token retention keeps the BFF
 // session store free of reusable OIDC credentials.
 func (s *Service) RPInitiatedLogoutURL(postLogoutRedirectURL string) (string, error) {
-	if s.meta.EndSessionEndpoint == "" {
+	md := s.metadata()
+	if md.EndSessionEndpoint == "" {
 		return "", fmt.Errorf("oidc provider does not advertise end-session endpoint")
 	}
-	u, err := url.Parse(s.meta.EndSessionEndpoint)
+	u, err := url.Parse(md.EndSessionEndpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", fmt.Errorf("oidc end-session endpoint is invalid")
 	}
@@ -117,8 +128,9 @@ type Identity struct {
 }
 
 func (s *Service) Exchange(ctx context.Context, code, verifier, nonceHash string) (Identity, error) {
+	md := s.metadata()
 	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {s.cfg.OIDCRedirectURL}, "client_id": {s.cfg.OIDCClientID}, "code_verifier": {verifier}}
-	req, e := http.NewRequestWithContext(ctx, http.MethodPost, s.transportURL(s.meta.TokenEndpoint), strings.NewReader(form.Encode()))
+	req, e := http.NewRequestWithContext(ctx, http.MethodPost, s.transportURL(md.TokenEndpoint), strings.NewReader(form.Encode()))
 	if e != nil {
 		return Identity{}, e
 	}
@@ -215,7 +227,8 @@ func (s *Service) key(kid string) (*rsa.PublicKey, error) {
 	if k != nil {
 		return k, nil
 	}
-	req, e := http.NewRequest(http.MethodGet, s.transportURL(s.meta.JWKSURI), nil)
+	md := s.metadata()
+	req, e := http.NewRequest(http.MethodGet, s.transportURL(md.JWKSURI), nil)
 	if e != nil {
 		return nil, e
 	}
