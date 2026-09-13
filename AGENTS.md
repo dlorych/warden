@@ -5,3 +5,17 @@ The platform surface consists of `compose.yaml`, `Dockerfile`, `dev/`, `cmd/gith
 Run `./devinit` (or `make dev`) before Compose so `.dev/rekor-signer.key` and the app trust material exist. Do not mount the `.dev` directory into the service: mount only the Rekor signer file required by the log container. Preserve the fixed Keycloak subject IDs, reviewer group, redirect ports and development passwords documented in `README.md`.
 
 Validation: `npm --prefix web ci --ignore-scripts && npm --prefix web run build`, `go test ./...` and `docker compose --env-file .dev/compose.env -f compose.yaml config --quiet`. Full-stack checks should exercise real Keycloak authorization-code login, signed GitHub webhook delivery and Rekor inclusion.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `dlorych/warden` using the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Domain documentation uses the single-context layout. See `docs/agents/domain.md`.
