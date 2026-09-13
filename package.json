@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "prepare": "husky",
-    "typecheck": "cd web && npx tsc -b",
+    "typecheck": "node scripts/typecheck-web.mjs",
     "test": "go test ./...",
     "lint:markdown": "markdownlint-cli2 '**/*.md' '#node_modules/**' '#web/node_modules/**' '#.agents/**'"
   },
