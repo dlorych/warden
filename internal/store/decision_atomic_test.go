@@ -10,26 +10,41 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/wardenv/service/internal/audit"
+	"github.com/wardenv/service/internal/authz"
 )
 
 type decisionTxStub struct {
-	requestSubject string
-	requestState   string
-	requestExpiry  time.Time
-	challenge      Challenge
-	execQueries    []string
-	auditErr       error
-	challengeErr   error
-	jobErr         error
-	commitErr      error
-	committed      bool
-	rolledBack     bool
+	requestSubject  string
+	requestState    string
+	requestExpiry   time.Time
+	challenge       Challenge
+	execQueries     []string
+	auditAction     string
+	auditOutcome    audit.Outcome
+	auditPermission string
+	auditErr        error
+	challengeErr    error
+	jobErr          error
+	commitErr       error
+	committed       bool
+	rolledBack      bool
 }
 
-func (s *decisionTxStub) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+func (s *decisionTxStub) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	s.execQueries = append(s.execQueries, query)
-	if strings.Contains(query, "INSERT INTO audit_events") && s.auditErr != nil {
-		return pgconn.CommandTag{}, s.auditErr
+	if strings.Contains(query, "INSERT INTO audit_events") {
+		if len(args) > 8 {
+			s.auditAction, _ = args[8].(string)
+		}
+		if len(args) > 9 {
+			s.auditOutcome, _ = args[9].(audit.Outcome)
+		}
+		if len(args) > 11 {
+			s.auditPermission, _ = args[11].(string)
+		}
+		if s.auditErr != nil {
+			return pgconn.CommandTag{}, s.auditErr
+		}
 	}
 	if strings.Contains(query, "INSERT INTO challenges") && s.challengeErr != nil {
 		return pgconn.CommandTag{}, s.challengeErr
@@ -88,8 +103,9 @@ func validDecisionTestEvent() audit.Event {
 		OperationID: "00000000-0000-4000-8000-000000000101",
 		RequestID:   "00000000-0000-4000-8000-000000000102",
 		ActorType:   audit.ActorUser,
-		ActionCode:  "decision.submit",
+		ActionCode:  audit.ActionDecisionAdd,
 		Outcome:     audit.OutcomeSuccess,
+		Permission:  string(authz.DecisionAdd),
 		Metadata:    []byte(`{"returned":1}`),
 	}
 }
@@ -129,6 +145,9 @@ func TestAcceptDecisionWithAuditCommitsBusinessStateAndSuccessEventTogether(t *t
 	}
 	if len(tx.execQueries) != 5 || !strings.Contains(tx.execQueries[len(tx.execQueries)-1], "INSERT INTO audit_events") {
 		t.Fatalf("transaction writes = %q, want business writes followed by audit insert", tx.execQueries)
+	}
+	if tx.auditAction != audit.ActionDecisionAdd || tx.auditOutcome != audit.OutcomeSuccess || tx.auditPermission != audit.ActionDecisionAdd {
+		t.Fatalf("audit insert action=%q outcome=%q permission=%q, want decision.add/success/decision.add", tx.auditAction, tx.auditOutcome, tx.auditPermission)
 	}
 }
 
