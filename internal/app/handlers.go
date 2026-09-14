@@ -566,7 +566,7 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 	if q.Action != "" && !validAuditFilterValue(q.Action, 128) || q.ActorID != "" && !validAuditFilterValue(q.ActorID, 256) || q.ResourceType != "" && !validAuditFilterValue(q.ResourceType, 128) || q.ResourceID != "" && !validAuditFilterValue(q.ResourceID, 256) {
 		return audit.Query{}, fmt.Errorf("invalid audit filter")
 	}
-	if q.Action != "" && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != "audit.initialized" {
+	if q.Action != "" && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != "audit.initialized" {
 		return audit.Query{}, fmt.Errorf("invalid audit action")
 	}
 	if raw := values.Get("limit"); raw != "" {
