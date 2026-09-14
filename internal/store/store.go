@@ -27,6 +27,27 @@ type decisionTx interface {
 	Rollback(context.Context) error
 }
 
+// AuditAppendError marks an error from an audit append attempted inside a
+// business transaction. Unwrap preserves the underlying database or
+// validation error for callers that need to inspect its cause.
+type AuditAppendError struct{ Err error }
+
+func (e *AuditAppendError) Error() string {
+	if e == nil || e.Err == nil {
+		return "audit append failed"
+	}
+	return fmt.Sprintf("audit append failed: %v", e.Err)
+}
+
+func (e *AuditAppendError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (*AuditAppendError) AuditAppendFailure() bool { return true }
+
 type Store struct {
 	db              *pgxpool.Pool
 	beginDecisionTx func(context.Context) (decisionTx, error)
@@ -396,6 +417,28 @@ func (s *Store) CreateChallenge(ctx context.Context, requestID, subject, decisio
 	_, e := s.db.Exec(ctx, `INSERT INTO challenges(nonce_hash,request_id,subject,decision,reason,expires_at) VALUES($1,$2,$3,$4,$5,$6)`, nonceHash, requestID, subject, decision, reason, expires)
 	return e
 }
+
+// CreateChallengeWithAudit atomically creates a challenge and appends its
+// supplied success event. Failure events must be appended separately after an
+// error is returned; they never participate in this transaction.
+func (s *Store) CreateChallengeWithAudit(ctx context.Context, requestID, subject, decision, reason, nonceHash string, expires time.Time, successEvent audit.Event) error {
+	begin := s.beginDecisionTx
+	if begin == nil {
+		begin = func(ctx context.Context) (decisionTx, error) { return s.db.Begin(ctx) }
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `INSERT INTO challenges(nonce_hash,request_id,subject,decision,reason,expires_at) VALUES($1,$2,$3,$4,$5,$6)`, nonceHash, requestID, subject, decision, reason, expires); err != nil {
+		return err
+	}
+	if err = appendAuditEvent(ctx, tx, successEvent); err != nil {
+		return &AuditAppendError{Err: err}
+	}
+	return tx.Commit(ctx)
+}
 func (s *Store) ConsumeChallenge(ctx context.Context, requestID, subject, nonceHash, decision, reason string, now time.Time) error {
 	tx, e := s.db.Begin(ctx)
 	if e != nil {
@@ -578,7 +621,7 @@ func (s *Store) acceptDecision(ctx context.Context, requestID, reviewerSubject, 
 	}
 	if successEvent != nil {
 		if e = appendAuditEvent(ctx, tx, *successEvent); e != nil {
-			return d, e
+			return d, &AuditAppendError{Err: e}
 		}
 	}
 	return d, tx.Commit(ctx)

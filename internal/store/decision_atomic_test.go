@@ -19,6 +19,7 @@ type decisionTxStub struct {
 	challenge      Challenge
 	execQueries    []string
 	auditErr       error
+	challengeErr   error
 	jobErr         error
 	commitErr      error
 	committed      bool
@@ -29,6 +30,9 @@ func (s *decisionTxStub) Exec(_ context.Context, query string, _ ...any) (pgconn
 	s.execQueries = append(s.execQueries, query)
 	if strings.Contains(query, "INSERT INTO audit_events") && s.auditErr != nil {
 		return pgconn.CommandTag{}, s.auditErr
+	}
+	if strings.Contains(query, "INSERT INTO challenges") && s.challengeErr != nil {
+		return pgconn.CommandTag{}, s.challengeErr
 	}
 	if strings.Contains(query, "INSERT INTO jobs") && s.jobErr != nil {
 		return pgconn.CommandTag{}, s.jobErr
@@ -150,6 +154,10 @@ func TestAcceptDecisionWithAuditRollsBackWhenAuditAppendFails(t *testing.T) {
 	if !errors.Is(err, auditErr) {
 		t.Fatalf("error = %v, want audit error", err)
 	}
+	var marker *AuditAppendError
+	if !errors.As(err, &marker) || !marker.AuditAppendFailure() {
+		t.Fatalf("error = %v, want AuditAppendError marker", err)
+	}
 	if tx.committed {
 		t.Fatal("audit failure committed business state")
 	}
@@ -179,6 +187,10 @@ func TestAcceptDecisionWithAuditDoesNotAppendFailureEventWhenMutationFails(t *te
 	_, err := newDecisionTestStore(tx).AcceptDecisionWithAudit(context.Background(), "request-id", "reviewer", "Reviewer", "approved", "ship it", "nonce-hash", []byte(`{"statement":true}`), "signature", validDecisionTestEvent())
 	if !errors.Is(err, jobErr) {
 		t.Fatalf("error = %v, want mutation error", err)
+	}
+	var marker *AuditAppendError
+	if errors.As(err, &marker) {
+		t.Fatalf("mutation error = %v, must not carry AuditAppendError", err)
 	}
 	if tx.committed {
 		t.Fatal("mutation failure committed business state")
