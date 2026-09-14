@@ -8,6 +8,29 @@ import (
 	"testing"
 )
 
+func TestNormalizedRolesDropsUnknownAndDuplicates(t *testing.T) {
+	got := normalizedRoles([]string{"reviewer", "unknown", " reader ", "reviewer", "AUDITOR"})
+	want := []string{"reader", "reviewer", "auditor"}
+	if len(got) != len(want) {
+		t.Fatalf("roles = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("roles = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestMalformedWardenRolesClaimCannotDecode(t *testing.T) {
+	var c claims
+	if err := json.Unmarshal([]byte(`{"warden_roles":["reader",7]}`), &c); err == nil {
+		t.Fatal("malformed warden_roles claim decoded successfully")
+	}
+	if err := json.Unmarshal([]byte(`{"warden_roles":[null]}`), &c); err == nil {
+		t.Fatal("null warden_roles element decoded successfully")
+	}
+}
+
 func TestRPInitiatedLogoutURLUsesDiscoveredEndpointAndConfiguredRedirect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-configuration" {

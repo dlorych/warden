@@ -1,0 +1,3 @@
+# Use explicit additive application roles
+
+Warden authorizes protected resources with application roles carried in a `warden_roles` token claim rather than inferring permissions directly from IdP groups. `reader` grants access to requests, decisions, and protected evidence; `reviewer` grants decision preparation and submission and also receives `reader`; `auditor` grants Audit Log access only. Roles combine by union, and the development Keycloak maps its existing and new groups to these roles. This makes auditor-only access possible without a special-case deny rule and keeps production authorization independent of IdP group structure.

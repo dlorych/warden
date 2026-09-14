@@ -11,14 +11,22 @@ import (
 	"fmt"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/wardenv/service/internal/audit"
 	"github.com/wardenv/service/internal/auth"
+	"github.com/wardenv/service/internal/authz"
 	"github.com/wardenv/service/internal/source"
 	"github.com/wardenv/service/internal/store"
 	"github.com/wardenv/service/pkg/evidence"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func (a *App) bffRouter() http.Handler {
@@ -32,6 +40,7 @@ func (a *App) bffRouter() http.Handler {
 	r.Get("/requests/{id}", a.bffRequest)
 	r.Get("/requests/{id}/evidence", a.bffEvidence)
 	r.Get("/decisions", a.bffDecisions)
+	r.Get("/audit", a.bffAudit)
 	return r
 }
 func chiRouter() *chi.Mux { return chi.NewRouter() }
@@ -41,7 +50,7 @@ func (a *App) session(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"authenticated": false})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"authenticated": true, "user": map[string]string{"subject": s.Subject, "name": s.Name}, "csrfToken": csrfFor(s)})
+	writeJSON(w, 200, map[string]any{"authenticated": true, "user": map[string]any{"subject": s.Subject, "name": s.Name, "roles": s.Roles}, "csrfToken": csrfFor(s)})
 }
 func csrfFor(s store.Session) string { return s.CSRFHash }
 func (a *App) currentSession(r *http.Request) (store.Session, error) {
@@ -51,6 +60,107 @@ func (a *App) currentSession(r *http.Request) (store.Session, error) {
 	}
 	return a.Store.GetSession(r.Context(), c.Value, time.Now(), a.Config.SessionIdle)
 }
+
+func (a *App) auditRepository() audit.Repository {
+	if a.Audit != nil {
+		return a.Audit
+	}
+	if a.Store == nil {
+		return nil
+	}
+	return a.Store
+}
+
+func auditActor(subject, name string, roles []string, actorType audit.ActorType) audit.Event {
+	return audit.Event{ActorID: subject, ActorName: name, ActorRoles: roles, ActorType: actorType}
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func (a *App) recordAudit(r *http.Request, event audit.Event, status int) error {
+	event = prepareAuditEvent(r, event, status)
+	repository := a.auditRepository()
+	if repository == nil {
+		err := fmt.Errorf("audit repository unavailable")
+		a.logAuditFailure(event, err)
+		return err
+	}
+	if err := repository.AppendAuditEvent(r.Context(), event); err != nil {
+		a.logAuditFailure(event, err)
+		return err
+	}
+	return nil
+}
+
+func prepareAuditEvent(r *http.Request, event audit.Event, status int) audit.Event {
+	if event.OperationID == "" {
+		event.OperationID = uuid.NewString()
+	}
+	if event.RequestID == "" {
+		event.RequestID = uuid.NewString()
+	}
+	event.OccurredAt = time.Now().UTC()
+	event.SchemaVersion = audit.EventSchemaVersion
+	event.IPAddress = clientIP(r)
+	event.UserAgent = truncateUserAgent(r.UserAgent(), 512)
+	event.Route = r.URL.Path
+	if event.Metadata == nil {
+		event.Metadata = json.RawMessage(fmt.Sprintf(`{"http_status":%d}`, status))
+	}
+	return event
+}
+
+func (a *App) logAuditFailure(event audit.Event, err error) {
+	logger := a.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Error("audit append failed", "emergency", true, "action", event.ActionCode, "outcome", event.Outcome, "route", event.Route, "error", err)
+}
+
+func truncateUserAgent(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func (a *App) failAudit(w http.ResponseWriter, r *http.Request, event audit.Event, status int) bool {
+	if a.recordAudit(r, event, status) != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Audit service unavailable")
+		return false
+	}
+	return true
+}
+
+func readAuditEvent(actor audit.Event, outcome audit.Outcome, reason, resourceID string) audit.Event {
+	actor.ActionCode = audit.ActionRequestRead
+	actor.Outcome = outcome
+	actor.Permission = string(authz.RequestRead)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	actor.ResourceType = "deployment_request"
+	actor.ResourceID = resourceID
+	return actor
+}
+
+func (a *App) browserSessionFailureReason(r *http.Request) string {
+	if _, err := r.Cookie(a.sessionCookieName()); err != nil {
+		return "session_missing"
+	}
+	return "session_invalid"
+}
+
 func (a *App) sessionCookieName() string {
 	if a.Config.CookieSecure {
 		return "__Host-warden_session"
@@ -91,7 +201,7 @@ func (a *App) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	csrf := randomToken(32)
-	sess, e := a.Store.CreateSession(r.Context(), id.Subject, id.Name, csrf, time.Now(), a.Config.SessionIdle, a.Config.SessionAbsolute)
+	sess, e := a.Store.CreateSession(r.Context(), id.Subject, id.Name, csrf, id.Roles, time.Now(), a.Config.SessionIdle, a.Config.SessionAbsolute)
 	if e != nil {
 		writeProblem(w, 500, "Could not create session")
 		return
@@ -189,8 +299,42 @@ type browserRequestDTO struct {
 func browserDTO(x store.Request) browserRequestDTO {
 	return browserRequestDTO{ID: x.ID, Repository: x.Repository, Environment: x.Environment, CommitSHA: x.CommitSHA, Requester: x.Requester, CreatedAt: x.CreatedAt, ExpiresAt: x.ExpiresAt, Decision: x.Decision, LogStatus: x.LogStatus, DeliveryStatus: x.DeliveryStatus, Reason: x.Reason}
 }
+
+// authorizeAuditedRequestRead is the authentication and authorization boundary
+// for the first request-detail tracer. Other protected browser reads retain the
+// issue-#2 behavior and are intentionally not audited until later tickets.
+func (a *App) authorizeAuditedRequestRead(w http.ResponseWriter, r *http.Request, resourceID string) (store.Session, audit.Event, bool) {
+	s, err := a.currentSession(r)
+	actor := auditActor("", "", nil, audit.ActorAnonymous)
+	actor.AuthMethod = "cookie"
+	if err != nil {
+		event := readAuditEvent(actor, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r), resourceID)
+		if !a.failAudit(w, r, event, http.StatusUnauthorized) {
+			return store.Session{}, event, false
+		}
+		writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		return store.Session{}, event, false
+	}
+	actor = auditActor(s.Subject, s.Name, s.Roles, audit.ActorUser)
+	actor.AuthMethod = "cookie"
+	decision := a.authorize(s.Roles, s.Subject, authz.RequestRead, authz.Resource{RequestID: resourceID})
+	if !decision.Allowed {
+		event := readAuditEvent(actor, audit.OutcomeDenied, decision.Reason, resourceID)
+		if !a.failAudit(w, r, event, http.StatusNotFound) {
+			return store.Session{}, event, false
+		}
+		writeProblem(w, http.StatusNotFound, "Resource not found")
+		return store.Session{}, event, false
+	}
+	return s, actor, true
+}
+
 func (a *App) bffRequests(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireBrowser(w, r); !ok {
+	s, ok := a.requireBrowser(w, r)
+	if !ok || !a.allows(s.Roles, s.Subject, authz.RequestRead, authz.Resource{}) {
+		if ok {
+			writeProblem(w, http.StatusForbidden, "Permission denied")
+		}
 		return
 	}
 	cursor := r.URL.Query().Get("cursor")
@@ -212,21 +356,52 @@ func (a *App) bffRequests(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": out, "nextCursor": next})
 }
 func (a *App) bffRequest(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireBrowser(w, r); !ok {
+	id := chi.URLParam(r, "id")
+	_, eventActor, ok := a.authorizeAuditedRequestRead(w, r, id)
+	if !ok {
 		return
 	}
-	x, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	if _, e := uuid.Parse(id); e != nil {
+		event := readAuditEvent(eventActor, audit.OutcomeInvalid, "request_id_invalid", id)
+		if !a.failAudit(w, r, event, http.StatusNotFound) {
+			return
+		}
+		writeProblem(w, http.StatusNotFound, "Request not found")
+		return
+	}
+	x, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
+		outcome, reason := audit.OutcomeInvalid, "request_not_found"
+		if !errors.Is(e, pgx.ErrNoRows) {
+			outcome, reason = audit.OutcomeFailed, "request_read_failed"
+		}
+		event := readAuditEvent(eventActor, outcome, reason, id)
+		if !a.failAudit(w, r, event, http.StatusNotFound) {
+			return
+		}
 		writeProblem(w, 404, "Request not found")
+		return
+	}
+	event := readAuditEvent(eventActor, audit.OutcomeSuccess, "read", id)
+	if !a.failAudit(w, r, event, http.StatusOK) {
 		return
 	}
 	writeJSON(w, 200, browserDTO(x))
 }
 func (a *App) bffEvidence(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireBrowser(w, r); !ok {
+	id := chi.URLParam(r, "id")
+	s, ok := a.requireBrowser(w, r)
+	if !ok || !a.allows(s.Roles, s.Subject, authz.EvidenceRead, authz.Resource{RequestID: id}) {
+		if ok {
+			writeProblem(w, http.StatusNotFound, "Evidence not found")
+		}
 		return
 	}
-	d, e := a.Store.RequestEvidence(r.Context(), chi.URLParam(r, "id"))
+	if _, e := uuid.Parse(id); e != nil {
+		writeProblem(w, http.StatusNotFound, "Evidence not found")
+		return
+	}
+	d, e := a.Store.RequestEvidence(r.Context(), id)
 	if e != nil {
 		writeProblem(w, 500, "Could not read evidence")
 		return
@@ -271,7 +446,11 @@ type decisionDTO struct {
 }
 
 func (a *App) bffDecisions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireBrowser(w, r); !ok {
+	s, ok := a.requireBrowser(w, r)
+	if !ok || !a.allows(s.Roles, s.Subject, authz.DecisionRead, authz.Resource{}) {
+		if ok {
+			writeProblem(w, http.StatusForbidden, "Permission denied")
+		}
 		return
 	}
 	cursor := r.URL.Query().Get("cursor")
@@ -291,6 +470,159 @@ func (a *App) bffDecisions(w http.ResponseWriter, r *http.Request) {
 		out[i] = decisionDTO{ID: x.ID, RequestID: x.RequestID, Reviewer: x.ReviewerName, Decision: x.Decision, Reason: x.Reason, CreatedAt: x.CreatedAt, Statement: x.Statement, Signature: x.Signature}
 	}
 	writeJSON(w, 200, map[string]any{"items": out, "nextCursor": next})
+}
+
+func auditReadEvent(actor audit.Event, outcome audit.Outcome, reason string) audit.Event {
+	actor.ActionCode = audit.ActionAuditRead
+	actor.Outcome = outcome
+	actor.Permission = string(authz.AuditRead)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.ResourceType = "audit_log"
+	actor.Reason = reason
+	return actor
+}
+
+func validAuditFilterValue(value string, max int) bool {
+	return len(value) <= max && value != "" && utf8.ValidString(value) && !strings.ContainsAny(value, "\r\n\x00")
+}
+
+func parseAuditQuery(values url.Values) (audit.Query, error) {
+	allowed := map[string]bool{"cursor": true, "limit": true, "action": true, "outcome": true, "actor_id": true, "resource_type": true, "resource_id": true, "operation_id": true, "from": true, "to": true}
+	for key := range values {
+		if !allowed[key] || len(values[key]) != 1 {
+			return audit.Query{}, fmt.Errorf("invalid audit filter")
+		}
+	}
+	q := audit.Query{Cursor: values.Get("cursor"), Limit: 50, Action: values.Get("action"), ActorID: values.Get("actor_id"), ResourceType: values.Get("resource_type"), ResourceID: values.Get("resource_id"), OperationID: values.Get("operation_id")}
+	if q.Cursor != "" && !validAuditFilterValue(q.Cursor, 512) {
+		return audit.Query{}, fmt.Errorf("invalid cursor")
+	}
+	if q.Cursor != "" {
+		if err := store.ValidateAuditCursor(q.Cursor); err != nil {
+			return audit.Query{}, fmt.Errorf("invalid cursor")
+		}
+	}
+	if q.Action != "" && !validAuditFilterValue(q.Action, 128) || q.ActorID != "" && !validAuditFilterValue(q.ActorID, 256) || q.ResourceType != "" && !validAuditFilterValue(q.ResourceType, 128) || q.ResourceID != "" && !validAuditFilterValue(q.ResourceID, 256) {
+		return audit.Query{}, fmt.Errorf("invalid audit filter")
+	}
+	if q.Action != "" && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != "audit.initialized" {
+		return audit.Query{}, fmt.Errorf("invalid audit action")
+	}
+	if raw := values.Get("limit"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 100 {
+			return audit.Query{}, fmt.Errorf("limit must be between 1 and 100")
+		}
+		q.Limit = limit
+	} else if _, ok := values["limit"]; ok {
+		return audit.Query{}, fmt.Errorf("limit must be between 1 and 100")
+	}
+	if raw := values.Get("outcome"); raw != "" {
+		q.Outcome = audit.Outcome(raw)
+		switch q.Outcome {
+		case audit.OutcomeStarted, audit.OutcomeSuccess, audit.OutcomeUnauthenticated, audit.OutcomeDenied, audit.OutcomeInvalid, audit.OutcomeFailed:
+		default:
+			return audit.Query{}, fmt.Errorf("invalid audit outcome")
+		}
+	} else if _, ok := values["outcome"]; ok {
+		return audit.Query{}, fmt.Errorf("invalid audit outcome")
+	}
+	if q.OperationID != "" {
+		if _, err := uuid.Parse(q.OperationID); err != nil {
+			return audit.Query{}, fmt.Errorf("invalid operation ID")
+		}
+	} else if _, ok := values["operation_id"]; ok {
+		return audit.Query{}, fmt.Errorf("invalid operation ID")
+	}
+	parseTime := func(key string) (*time.Time, error) {
+		raw := values.Get(key)
+		if raw == "" {
+			if _, ok := values[key]; ok {
+				return nil, fmt.Errorf("invalid %s time", key)
+			}
+			return nil, nil
+		}
+		if len(raw) > 40 {
+			return nil, fmt.Errorf("invalid %s time", key)
+		}
+		t, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s time", key)
+		}
+		t = t.UTC()
+		return &t, nil
+	}
+	var err error
+	if q.From, err = parseTime("from"); err != nil {
+		return audit.Query{}, err
+	}
+	if q.To, err = parseTime("to"); err != nil {
+		return audit.Query{}, err
+	}
+	if q.From != nil && q.To != nil && q.From.After(*q.To) {
+		return audit.Query{}, fmt.Errorf("from must not be after to")
+	}
+	return q, nil
+}
+
+func (a *App) bffAudit(w http.ResponseWriter, r *http.Request) {
+	s, err := a.currentSession(r)
+	actor := auditActor("", "", nil, audit.ActorAnonymous)
+	actor.AuthMethod = "cookie"
+	if err == nil {
+		actor = auditActor(s.Subject, s.Name, s.Roles, audit.ActorUser)
+		actor.AuthMethod = "cookie"
+	}
+	if err != nil {
+		if !a.failAudit(w, r, auditReadEvent(actor, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r)), http.StatusUnauthorized) {
+			return
+		}
+		writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	decision := a.authorize(s.Roles, s.Subject, authz.AuditRead, authz.Resource{})
+	if !decision.Allowed {
+		if !a.failAudit(w, r, auditReadEvent(actor, audit.OutcomeDenied, decision.Reason), http.StatusForbidden) {
+			return
+		}
+		writeProblem(w, http.StatusForbidden, "Permission denied")
+		return
+	}
+	q, err := parseAuditQuery(r.URL.Query())
+	if err != nil {
+		if !a.failAudit(w, r, auditReadEvent(actor, audit.OutcomeInvalid, err.Error()), http.StatusBadRequest) {
+			return
+		}
+		writeProblem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, queryErr, appendErr := a.selectAndAuditRead(r, q, actor)
+	if queryErr != nil {
+		if !a.failAudit(w, r, auditReadEvent(actor, audit.OutcomeFailed, "audit_query_failed"), http.StatusInternalServerError) {
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, "Could not read audit log")
+		return
+	}
+	if appendErr != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "Audit service unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+// selectAndAuditRead makes the query-before-append ordering a named seam. A
+// successful snapshot is never returned to the caller until its own audit
+// event has committed; query failures remain distinguishable so callers can
+// record a failed attempt without recursively auditing an append failure.
+func (a *App) selectAndAuditRead(r *http.Request, q audit.Query, actor audit.Event) (audit.Page, error, error) {
+	page, queryErr := a.auditRepository().ListAuditEvents(r.Context(), q)
+	if queryErr != nil {
+		return audit.Page{}, queryErr, nil
+	}
+	event := auditReadEvent(actor, audit.OutcomeSuccess, "read")
+	event.Metadata = json.RawMessage(fmt.Sprintf(`{"returned":%d}`, len(page.Items)))
+	return page, nil, a.recordAudit(r, event, http.StatusOK)
 }
 
 func (a *App) apiRouter() http.Handler {
@@ -322,27 +654,59 @@ func (a *App) requireCLI(next http.Handler) http.Handler {
 			writeProblem(w, 401, "Invalid access token")
 			return
 		}
-		if strings.HasSuffix(r.URL.Path, "/decisions") || strings.HasSuffix(r.URL.Path, "/challenges") {
-			reviewer := false
-			for _, g := range id.Groups {
-				if g == "reviewers" {
-					reviewer = true
-					break
-				}
-			}
-			if !reviewer {
-				writeProblem(w, 403, "Reviewer group required")
+		action, resourceAware := cliPermission(r.URL.Path)
+		if resourceAware {
+			// This coarse gate prevents non-reviewers from reaching a decision
+			// handler. The handler's final Authorize call still needs the
+			// request owner and is the only terminal authorization decision.
+			if !authz.HasRole(authz.Principal{Subject: id.Subject, Roles: rolesFromStrings(id.Roles)}, authz.RoleReviewer) {
+				writeProblem(w, http.StatusNotFound, "Resource not found")
 				return
 			}
+		} else if !a.allows(id.Roles, id.Subject, action, authz.Resource{RequestID: chi.URLParam(r, "id")}) {
+			writeProblem(w, http.StatusNotFound, "Resource not found")
+			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cliIdentityKey{}, id)))
 	})
 }
+
+func cliPermission(path string) (authz.Permission, bool) {
+	if strings.HasSuffix(path, "/evidence") {
+		return authz.EvidenceRead, false
+	}
+	if strings.HasSuffix(path, "/decisions") {
+		return authz.DecisionAdd, true
+	}
+	if strings.HasSuffix(path, "/challenges") {
+		return authz.DecisionPrepare, true
+	}
+	return authz.RequestRead, false
+}
 func identity(r *http.Request) auth.Identity {
 	return r.Context().Value(cliIdentityKey{}).(auth.Identity)
 }
+func (a *App) allows(roles []string, subject string, action authz.Action, resource authz.Resource) bool {
+	return a.authorize(roles, subject, action, resource).Allowed
+}
+func (a *App) authorize(roles []string, subject string, action authz.Action, resource authz.Resource) authz.Decision {
+	principal := authz.Principal{Subject: subject, Roles: rolesFromStrings(roles)}
+	if a.Policy == nil {
+		return authz.Policy{}.Authorize(authz.Request{Principal: principal, Permission: action, Resource: resource})
+	}
+	return a.Policy.Authorize(authz.Request{Principal: principal, Permission: action, Resource: resource})
+}
+func rolesFromStrings(roles []string) []authz.Role {
+	normalized := authz.NormalizeRoles(roles)
+	return normalized
+}
 func (a *App) apiRequest(w http.ResponseWriter, r *http.Request) {
-	x, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+	if _, e := uuid.Parse(id); e != nil {
+		writeProblem(w, 404, "Request not found")
+		return
+	}
+	x, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
 		writeProblem(w, 404, "Request not found")
 		return
@@ -364,6 +728,17 @@ func (a *App) apiEvidence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": d})
 }
 func (a *App) challenge(w http.ResponseWriter, r *http.Request) {
+	// Load and authorize the target first so resource denial is indistinguishable
+	// from a missing request, even when the submitted challenge body is invalid.
+	x, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	if e != nil {
+		writeProblem(w, 404, "Request not found")
+		return
+	}
+	if !a.allows(identity(r).Roles, identity(r).Subject, authz.DecisionPrepare, authz.Resource{RequestID: x.ID, RequesterSubject: x.RequesterSubject}) {
+		writeProblem(w, http.StatusNotFound, "Request not found")
+		return
+	}
 	var in struct {
 		Decision string `json:"decision"`
 		Reason   string `json:"reason"`
@@ -378,12 +753,7 @@ func (a *App) challenge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	x, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
-	if e != nil {
-		writeProblem(w, 404, "Request not found")
-		return
-	}
-	if x.Decision != "pending" || time.Now().After(x.ExpiresAt) || x.RequesterSubject == identity(r).Subject {
+	if x.Decision != "pending" || time.Now().After(x.ExpiresAt) {
 		writeProblem(w, 409, "request is not eligible for a challenge")
 		return
 	}
@@ -399,6 +769,18 @@ func (a *App) challenge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"statement": statement, "challenge": statement})
 }
 func (a *App) decide(w http.ResponseWriter, r *http.Request) {
+	// Resolve and authorize the target before parsing untrusted evidence. This
+	// keeps missing, unauthorized, and self-owned resources on the same 404
+	// path and prevents request existence disclosure through validation errors.
+	reqForDecision, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	if e != nil {
+		writeProblem(w, 404, "Request not found")
+		return
+	}
+	if !a.allows(identity(r).Roles, identity(r).Subject, authz.DecisionAdd, authz.Resource{RequestID: reqForDecision.ID, RequesterSubject: reqForDecision.RequesterSubject}) {
+		writeProblem(w, http.StatusNotFound, "Request not found")
+		return
+	}
 	var bundle evidence.Bundle
 	body, eRead := io.ReadAll(r.Body)
 	if eRead != nil || json.Unmarshal(body, &bundle) != nil || bundle.Signed.Statement.RequestID == "" {
@@ -441,11 +823,6 @@ func (a *App) decide(w http.ResponseWriter, r *http.Request) {
 	var st evidence.Statement
 	if e := json.Unmarshal(statementJSON, &st); e != nil {
 		writeProblem(w, 400, "invalid signed statement")
-		return
-	}
-	reqForDecision, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
-	if e != nil {
-		writeProblem(w, 404, "Request not found")
 		return
 	}
 	ctxDigest := sha256.Sum256(reqForDecision.Context)

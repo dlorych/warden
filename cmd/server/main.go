@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"github.com/wardenv/service/internal/app"
+	"github.com/wardenv/service/internal/migrations"
 	"log/slog"
 	"net/http"
 	"os"
@@ -26,8 +27,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer a.Close()
-	if e = a.Store.Migrate(ctx); e != nil {
-		logger.Error("migration failed", "error", e)
+	if e = a.Store.CheckSchemaVersion(ctx, migrations.CurrentVersion); e != nil {
+		logger.Error("schema check failed", "error", e)
 		os.Exit(1)
 	}
 	a.StartWorker(ctx)

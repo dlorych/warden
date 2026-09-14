@@ -13,9 +13,11 @@ RUN go mod download
 COPY . ./
 COPY --from=web-build /src/web/dist ./web/dist
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/warden ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/migrate ./cmd/migrate
 
 FROM golang:1.26.0-bookworm@sha256:2a0ba12e116687098780d3ce700f9ce3cb340783779646aafbabed748fa6677c
 COPY --from=go-build /out/warden /usr/local/bin/warden
+COPY --from=go-build /out/migrate /usr/local/bin/migrate
 COPY --from=web-build /src/web/dist /app/web/dist
 ENV ADDR=:8080 WEB_DIST=/app/web/dist
 EXPOSE 8080

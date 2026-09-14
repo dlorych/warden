@@ -4,7 +4,9 @@ import (
 	"context"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wardenv/service/internal/audit"
 	"github.com/wardenv/service/internal/auth"
+	"github.com/wardenv/service/internal/authz"
 	"github.com/wardenv/service/internal/github"
 	"github.com/wardenv/service/internal/source"
 	"github.com/wardenv/service/internal/store"
@@ -19,7 +21,9 @@ type App struct {
 	DB     *pgxpool.Pool
 	Store  *store.Store
 	Auth   *auth.Service
+	Policy authz.Authorizer
 	Source source.Adapter
+	Audit  audit.Repository
 	logger *slog.Logger
 }
 
@@ -32,7 +36,8 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	a := &App{Config: cfg, DB: db, Store: store.New(db), logger: logger}
+	a := &App{Config: cfg, DB: db, Store: store.New(db), Policy: authz.Policy{}, logger: logger}
+	a.Audit = a.Store
 	a.Auth = auth.New(auth.Config{OIDCIssuer: cfg.OIDCIssuer, OIDCClientID: cfg.OIDCClientID, OIDCClientSecret: cfg.OIDCClientSecret, OIDCRedirectURL: cfg.OIDCRedirectURL, OIDCAudience: cfg.OIDCAudience, OIDCInternalBaseURL: cfg.OIDCInternalBaseURL})
 	gh := github.New(cfg.GitHubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubPrivateKey)
 	a.Source = gh.AsAdapter(cfg.GitHubWebhookSecret, cfg.GitHubActorSubjects)

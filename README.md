@@ -13,7 +13,20 @@ The first command creates ignored development trust material, builds the React a
 make dev
 ```
 
-The seeded Keycloak users are `requester` / `requester-dev-password` and `reviewer` / `reviewer-dev-password`. Keycloak is at `http://localhost:8180`; the mock admin API is at `http://localhost:8090`.
+Compose starts PostgreSQL, bootstraps the `warden_migrator` and
+`warden_runtime` roles, runs the pinned Goose migrations, and only then starts
+Warden. The standalone migrator uses pinned Pressly Goose v3.27.3. The application connects as `warden_runtime`, which has the DML
+privileges needed by the service but cannot create or alter schema objects.
+Migration state is stored in PostgreSQL's `goose_db_version` table; if the
+migration prerequisite is skipped or incomplete, Warden refuses to start.
+
+The seeded Keycloak users are `requester` / `requester-dev-password`,
+`reviewer` / `reviewer-dev-password`, and the auditor-only
+`auditor` / `auditor-dev-password` fixture. Their stable development subjects
+are `11111111-1111-4111-8111-111111111111`,
+`22222222-2222-4222-8222-222222222222`, and
+`33333333-3333-4333-8333-333333333333`, respectively. Keycloak is at
+`http://localhost:8180`; the mock admin API is at `http://localhost:8090`.
 
 Create a deployment request. Copy the request ID and the review URL printed by the command:
 

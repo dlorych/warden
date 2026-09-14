@@ -9,6 +9,28 @@ services:
     volumes: [warden_pg:/var/lib/postgresql/data]
     healthcheck: {test: ["CMD-SHELL", "pg_isready -U warden -d warden"], interval: 3s, timeout: 3s, retries: 20}
 
+  postgres-bootstrap:
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    environment:
+      BOOTSTRAP_DATABASE_URL: postgres://warden:warden-dev-password@postgres:5432/warden
+      MIGRATOR_PASSWORD: ${MIGRATOR_PASSWORD:-warden-migrator-dev-password}
+      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-warden-runtime-dev-password}
+    volumes: [./dev/postgres/bootstrap.sql:/bootstrap.sql:ro]
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["psql \"$${BOOTSTRAP_DATABASE_URL}\" -v ON_ERROR_STOP=1 -v migrator_password=\"$${MIGRATOR_PASSWORD}\" -v runtime_password=\"$${RUNTIME_PASSWORD}\" -f /bootstrap.sql"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  migrate:
+    build: .
+    environment:
+      MIGRATION_DATABASE_URL: postgres://warden_migrator:${MIGRATOR_PASSWORD:-warden-migrator-dev-password}@postgres:5432/warden?sslmode=disable
+    entrypoint: ["/usr/local/bin/migrate"]
+    depends_on:
+      postgres-bootstrap: {condition: service_completed_successfully}
+    restart: "no"
+
   keycloak:
     image: keycloak/keycloak:26.3.3@sha256:6a7217a100bd3e5de4063a27a538ef999a3c5a88c4b4ec0ffc0a642aee7b2597
     command: ["start-dev", "--import-realm", "--http-port=8080", "--hostname=http://localhost:8180", "--http-relative-path=/"]
@@ -55,7 +77,7 @@ services:
     build: .
     environment:
       ADDR: ":8080"
-      DATABASE_URL: postgres://warden:warden-dev-password@postgres:5432/warden?sslmode=disable
+      DATABASE_URL: postgres://warden_runtime:${RUNTIME_PASSWORD:-warden-runtime-dev-password}@postgres:5432/warden?sslmode=disable
       PUBLIC_URL: http://localhost:8080
       WEB_URL: http://localhost:8080
       OIDC_ISSUER: http://localhost:8180/realms/warden
@@ -80,7 +102,7 @@ services:
       - ./.dev/rekor-public.pem:/run/warden-trust/rekor-public.pem:ro
       - ./.dev/ca.pem:/run/warden-trust/ca.pem:ro
     depends_on:
-      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
       keycloak: {condition: service_healthy}
       githubmock: {condition: service_healthy}
       rekor: {condition: service_healthy}

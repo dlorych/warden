@@ -1,0 +1,3 @@
+# Use an append-only Audit Log
+
+Warden records each semantic protected-resource action it receives as an Audit Event in PostgreSQL, including reads, writes, authentication outcomes visible to Warden, authorization denials, and system actions. Business actions fail closed when their Audit Event cannot be appended; successful writes and their events commit atomically where Warden controls the transaction. Runtime database credentials may append and read events but may not update, delete, or truncate them. Database administrators remain trusted, false appends by a compromised runtime credential are outside this guarantee, and events are retained indefinitely until a separately reviewed policy replaces that decision.

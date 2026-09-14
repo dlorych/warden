@@ -2,13 +2,29 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
 
-type User = { subject: string; name: string }
+type User = { subject: string; name: string; roles?: string[] }
 type Session = { authenticated: boolean; user?: User; csrfToken?: string }
 type RequestItem = {
   id: string; repository: string; environment: string; commit_sha: string; requester: string
   created_at: string; expires_at: string; decision: string; log_status: string; delivery_status: string; reason?: string
 }
 type Evidence = { id?: string; kind?: string; digest?: string; payload?: unknown; [key: string]: unknown }
+type AuditEvent = {
+  id: number; occurred_at: string; action_code: string; outcome: string; actor_id: string; actor_name: string
+  actor_type: string; actor_roles: string[]; operation_id: string; request_id: string; resource_type: string
+  resource_id: string; reason: string; auth_method: string; permission: string; policy_version: string
+  ip_address: string; user_agent: string; route: string; metadata: unknown
+}
+type AuditFilters = { action: string; outcome: string; actor: string; resource: string }
+const auditQuery = (filters: AuditFilters, cursor = '') => {
+  const q = new URLSearchParams()
+  if (filters.action) q.set('action', filters.action)
+  if (filters.outcome) q.set('outcome', filters.outcome)
+  if (filters.actor) q.set('actor_id', filters.actor)
+  if (filters.resource) q.set('resource_id', filters.resource)
+  if (cursor) q.set('cursor', cursor)
+  return q
+}
 
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, { credentials: 'same-origin', ...init, headers: { Accept: 'application/json', ...(init?.headers || {}) } })
@@ -30,15 +46,20 @@ function App() {
 }
 
 function Authenticated({ session }: { session: Session }) {
-  const [selected, setSelected] = useState<string | null>(() => location.pathname.match(/\/requests\/([^/]+)/)?.[1] || null)
+  const canRequests = (session.user?.roles || []).some(role => role === 'reader' || role === 'reviewer')
+  const canAudit = (session.user?.roles || []).includes('auditor')
+  const [view, setView] = useState<'requests' | 'audit'>(() => !canRequests || location.pathname === '/audit' ? 'audit' : 'requests')
+  const [selected, setSelected] = useState<string | null>(() => canRequests ? location.pathname.match(/\/requests\/([^/]+)/)?.[1] || null : null)
   const [items, setItems] = useState<RequestItem[]>([])
   const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [nextCursor, setNextCursor] = useState('')
-  const load = useCallback(async (cursor = '') => { setLoading(true); try { const x = await api<{ items?: RequestItem[]; nextCursor?: string; next_cursor?: string }>(`/bff/requests${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`); setItems(cursor ? [...items, ...(x.items || [])] : (x.items || [])); setNextCursor(x.nextCursor || x.next_cursor || ''); setError('') } catch (e) { setError((e as Error).message) } finally { setLoading(false) } }, [items])
-  useEffect(() => { void load() }, [])
-  useEffect(() => { const timer = window.setInterval(() => { if (!document.hidden) void load() }, 15000); return () => clearInterval(timer) }, [load])
-  const open = (id: string) => { setSelected(id); history.pushState({}, '', `/requests/${id}`) }
-  useEffect(() => { const f = () => setSelected(location.pathname.match(/\/requests\/([^/]+)/)?.[1] || null); addEventListener('popstate', f); return () => removeEventListener('popstate', f) }, [])
-  return <Shell user={session.user} csrf={session.csrfToken}><div className="layout"><aside className="sidebar"><div className="brand"><span className="brand-mark">W</span><span>warden</span></div><div className="side-label">Workspace</div><nav><button className="nav-active"><span>◈</span> Requests <b>{items.filter(x => x.decision === 'pending').length || ''}</b></button><button onClick={() => alert('Audit history is available per request.')}><span>◷</span> Audit log</button></nav><div className="side-foot"><span className="online" /> Local development</div></aside><main className="main"><header className="topbar"><div><div className="eyebrow">Operations / approvals</div><h2>Deployment requests</h2></div><div className="top-actions"><button className="icon-btn" title="Refresh" onClick={() => void load()}>↻</button><div className="avatar">{(session.user?.name || 'U').slice(0, 1).toUpperCase()}</div><span className="username">{session.user?.name || 'Signed in'}</span><button className="logout" onClick={() => void logout(session.csrfToken)}>Log out</button></div></header><div className="content">{selected ? <RequestDetail id={selected} csrf={session.csrfToken} onBack={() => { open(''); history.pushState({}, '', '/'); }} /> : <RequestList items={items} loading={loading} error={error} nextCursor={nextCursor} onOpen={open} onMore={() => void load(nextCursor)} onRetry={() => void load()} />}</div></main></div></Shell>
+  const load = useCallback(async (cursor = '') => { if (!canRequests) return; setLoading(true); try { const x = await api<{ items?: RequestItem[]; nextCursor?: string; next_cursor?: string }>(`/bff/requests${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`); setItems(previous => cursor ? [...previous, ...(x.items || [])] : (x.items || [])); setNextCursor(x.nextCursor || x.next_cursor || ''); setError('') } catch (e) { setError((e as Error).message) } finally { setLoading(false) } }, [canRequests])
+  useEffect(() => { if (canRequests) void load() }, [canRequests, load])
+  useEffect(() => { if (!canRequests) return; const timer = window.setInterval(() => { if (!document.hidden) void load() }, 15000); return () => clearInterval(timer) }, [canRequests, load])
+  const open = (id: string) => { setView('requests'); setSelected(id || null); history.pushState({}, '', id ? `/requests/${id}` : '/') }
+  useEffect(() => { const f = () => { const id = location.pathname.match(/\/requests\/([^/]+)/)?.[1]; setSelected(id || null); setView(location.pathname === '/audit' ? 'audit' : 'requests') }; addEventListener('popstate', f); return () => removeEventListener('popstate', f) }, [])
+  const showAudit = () => { setView('audit'); setSelected(null); history.pushState({}, '', '/audit') }
+  const showRequests = () => { setView('requests'); history.pushState({}, '', '/') }
+  return <Shell user={session.user} csrf={session.csrfToken}><div className="layout"><aside className="sidebar"><div className="brand"><span className="brand-mark">W</span><span>warden</span></div><div className="side-label">Workspace</div><nav>{canRequests && <button className={view === 'requests' ? 'nav-active' : ''} onClick={showRequests}><span>◈</span> Requests <b>{items.filter(x => x.decision === 'pending').length || ''}</b></button>}{canAudit && <button className={view === 'audit' ? 'nav-active' : ''} onClick={showAudit}><span>◷</span> Audit log</button>}</nav><div className="side-foot"><span className="online" /> Local development</div></aside><main className="main"><header className="topbar"><div><div className="eyebrow">Operations / {view === 'audit' ? 'audit' : 'approvals'}</div><h2>{view === 'audit' ? 'Audit log' : 'Deployment requests'}</h2></div><div className="top-actions">{view === 'requests' && <button className="icon-btn" title="Refresh" onClick={() => void load()}>↻</button>}<div className="avatar">{(session.user?.name || 'U').slice(0, 1).toUpperCase()}</div><span className="username">{session.user?.name || 'Signed in'}</span><button className="logout" onClick={() => void logout(session.csrfToken)}>Log out</button></div></header><div className="content">{view === 'audit' ? <AuditLog /> : selected ? <RequestDetail id={selected} csrf={session.csrfToken} onBack={() => open('')} /> : <RequestList items={items} loading={loading} error={error} nextCursor={nextCursor} onOpen={open} onMore={() => void load(nextCursor)} onRetry={() => void load()} />}</div></main></div></Shell>
 }
 async function logout(csrf?: string) {
   let redirected = false
@@ -46,6 +67,22 @@ async function logout(csrf?: string) {
     const result = await api<{ logoutURL?: string }>('/bff/logout', { method: 'POST', headers: { 'X-CSRF-Token': csrf || '' } })
     if (result.logoutURL) { redirected = true; window.location.assign(result.logoutURL); return }
   } finally { if (!redirected && !document.hidden) location.reload() }
+}
+
+function AuditLog() {
+  const [events, setEvents] = useState<AuditEvent[]>([]); const [cursor, setCursor] = useState(''); const [loading, setLoading] = useState(false); const [error, setError] = useState('')
+  const [action, setAction] = useState(''); const [outcome, setOutcome] = useState(''); const [actor, setActor] = useState(''); const [resource, setResource] = useState('')
+  const filters = { action, outcome, actor, resource }
+  const load = useCallback(async (nextCursor = '') => {
+    setLoading(true)
+    try {
+      const q = auditQuery(filters, nextCursor)
+      const result = await api<{ items?: AuditEvent[]; nextCursor?: string }>(`/bff/audit${q.toString() ? `?${q}` : ''}`)
+      setEvents(nextCursor ? previous => [...previous, ...(result.items || [])] : (result.items || [])); setCursor(result.nextCursor || ''); setError('')
+    } catch (e) { setError((e as Error).message) } finally { setLoading(false) }
+  }, [action, outcome, actor, resource])
+  useEffect(() => { void load() }, [])
+  return <><div className="toolbar audit-toolbar"><div><p className="lede">Immutable access history for protected resources.</p></div><button className="refresh" onClick={() => void load()} disabled={loading}>Refresh <span>↻</span></button></div><div className="audit-filters"><input aria-label="Action" placeholder="Action (e.g. request.read)" value={action} onChange={e => setAction(e.target.value)} /><select aria-label="Outcome" value={outcome} onChange={e => setOutcome(e.target.value)}><option value="">All outcomes</option><option>success</option><option>unauthenticated</option><option>denied</option><option>invalid</option><option>failed</option></select><input aria-label="Actor" placeholder="Actor ID" value={actor} onChange={e => setActor(e.target.value)} /><input aria-label="Resource" placeholder="Resource ID" value={resource} onChange={e => setResource(e.target.value)} /><button className="refresh" onClick={() => void load()}>Apply</button></div>{error && <ErrorBox message={error} retry={() => void load()} />}{loading && !events.length ? <Spinner label="Loading audit log…" /> : events.length === 0 ? <div className="empty"><div className="empty-icon">◷</div><h3>No audit events</h3><p>Events matching these filters will appear here.</p></div> : <div className="table-wrap audit-table"><table><thead><tr><th>Timestamp</th><th>Action</th><th>Outcome</th><th>Actor</th><th>Resource</th><th>Operation / request</th></tr></thead><tbody>{events.map(event => <tr key={event.id}><td className="muted">{new Date(event.occurred_at).toLocaleString()}</td><td><strong>{event.action_code}</strong><small>{event.permission}</small></td><td><span className={statusClass(event.outcome)}>{event.outcome}</span></td><td>{event.actor_name || event.actor_id || event.actor_type}<small>{event.actor_roles?.join(', ')}</small></td><td>{event.resource_type}<small className="mono">{event.resource_id || '—'}</small></td><td><small className="mono">op {event.operation_id.slice(0, 8)}</small><small className="mono">req {event.request_id.slice(0, 8)}</small><details className="audit-meta"><summary>Metadata</summary><pre>{JSON.stringify(event.metadata, null, 2)}</pre></details></td></tr>)}</tbody></table>{cursor && <button className="load-more" onClick={() => void load(cursor)}>Load more</button>}</div>}</>
 }
 
 function RequestList({ items, loading, error, nextCursor, onOpen, onMore, onRetry }: { items: RequestItem[]; loading: boolean; error: string; nextCursor: string; onOpen: (id: string) => void; onMore: () => void; onRetry: () => void }) {

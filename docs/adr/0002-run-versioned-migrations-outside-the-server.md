@@ -1,0 +1,3 @@
+# Run versioned migrations outside the server
+
+Warden uses pinned Pressly Goose tooling in a separate repository-owned migration command instead of changing schema during server startup. Compose runs it as a one-shot prerequisite and a future Kubernetes deployment will run it as an init container. Infrastructure provisions a schema-owning `warden_migrator` login and a least-privileged `warden_runtime` login; Goose manages schema objects and explicit grants but not database roles or passwords. This separation prevents a compromised long-running application credential from acquiring schema-owner powers, at the cost of an additional deployment step and credential.

@@ -15,6 +15,17 @@ returns the current user and CSRF token. Browser reads such as
 give the browser an OIDC access token. Browser writes, including
 `/bff/logout`, require the session CSRF token and origin checks.
 
+The first audited protected read is the browser request-detail endpoint,
+`/bff/requests/{id}`, which appends immutable Audit Events under the stable
+`request.read` Action Code for successful, invalid, unauthenticated, denied,
+and failed outcomes. An Audit Event append failure returns `503` without the
+protected payload. The auditor-only `/bff/audit` endpoint uses the stable
+`audit.read` Action Code, bounded keyset pagination, and finite action,
+outcome, actor, resource, operation, and UTC time filters. Its own successful
+and unsuccessful reads are appended after selecting the result snapshot, so
+the event for a query appears only on the next query. Authentication, list,
+decision, evidence, and bearer-path auditing are deferred to later issues.
+
 `GET /evidence/{request-id}` is a public, immutable read path for the
 published evidence bundle referenced by source callbacks. It is deliberately
 separate from the authenticated BFF and bearer CLI APIs.
@@ -41,7 +52,7 @@ the fixed loopback callback `127.0.0.1:18765`, audience `warden-cli`, and the
 `POST /requests/{id}/decisions`, and reads evidence with
 `GET /requests/{id}/evidence`. Cookies are rejected on this boundary. An
 explicit `--access-token` is available for headless tests and automation; it
-does not bypass bearer-token validation or reviewer-group authorization.
+does not bypass bearer-token validation or application-role authorization.
 
 The challenge statement is bound to the displayed request, request ID,
 decision, reason, authenticated subject, nonce, and expiry. The CLI displays
@@ -133,8 +144,8 @@ adding workers later.
 - Source webhooks require the configured HMAC signature and source-specific
   validation before a request is stored.
 - OIDC tokens are checked at the API boundary for issuer, signature, audience,
-  expiry, and `warden:decide`; decision endpoints also require the reviewer
-  group.
+  expiry, and `warden:decide`; application roles from the `warden_roles` claim
+  authorize each action with a default-deny policy.
 - Browser sessions are HttpOnly and same-origin. Mutating BFF requests require
   origin validation and the session CSRF token.
 - A challenge is bound to request ID, reviewer subject, decision, reason, and

@@ -1,48 +1,276 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wardenv/service/internal/audit"
+	"github.com/wardenv/service/internal/authz"
+	"io"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-type Store struct{ db *pgxpool.Pool }
+type decisionTx interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Commit(context.Context) error
+	Rollback(context.Context) error
+}
 
-func New(db *pgxpool.Pool) *Store                  { return &Store{db: db} }
-func (s *Store) Migrate(ctx context.Context) error { _, err := s.db.Exec(ctx, schema); return err }
+type Store struct {
+	db              *pgxpool.Pool
+	beginDecisionTx func(context.Context) (decisionTx, error)
+}
 
-const schema = `CREATE TABLE IF NOT EXISTS requests (id uuid PRIMARY KEY, repository text NOT NULL, environment text NOT NULL, commit_sha text NOT NULL, requester text NOT NULL, requester_subject text NOT NULL, context jsonb NOT NULL DEFAULT '{}'::jsonb, created_at timestamptz NOT NULL, expires_at timestamptz NOT NULL, decision text NOT NULL DEFAULT 'pending' CHECK(decision IN ('pending','approved','rejected')), reason text NOT NULL DEFAULT '', log_status text NOT NULL DEFAULT 'pending', delivery_status text NOT NULL DEFAULT 'pending');
-CREATE TABLE IF NOT EXISTS decisions (id uuid PRIMARY KEY, request_id uuid NOT NULL REFERENCES requests(id), reviewer_subject text NOT NULL, reviewer_name text NOT NULL, decision text NOT NULL CHECK(decision IN ('approved','rejected')), reason text NOT NULL DEFAULT '', statement jsonb NOT NULL, signature text NOT NULL DEFAULT '', created_at timestamptz NOT NULL, UNIQUE(request_id,reviewer_subject));
-ALTER TABLE decisions ADD COLUMN IF NOT EXISTS published_bundle jsonb;
-CREATE TABLE IF NOT EXISTS sessions (id text PRIMARY KEY, subject text NOT NULL, name text NOT NULL, groups_json jsonb NOT NULL DEFAULT '[]', csrf_hash text NOT NULL, created_at timestamptz NOT NULL, last_seen timestamptz NOT NULL, expires_at timestamptz NOT NULL);
-CREATE TABLE IF NOT EXISTS oauth_states (id text PRIMARY KEY, state_hash text UNIQUE NOT NULL, verifier text NOT NULL, nonce_hash text NOT NULL, redirect_uri text NOT NULL, created_at timestamptz NOT NULL, expires_at timestamptz NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs (id uuid PRIMARY KEY, kind text NOT NULL, request_id uuid NOT NULL, payload jsonb NOT NULL, status text NOT NULL DEFAULT 'pending', attempts int NOT NULL DEFAULT 0, run_after timestamptz NOT NULL, last_error text NOT NULL DEFAULT '');
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_at timestamptz;
-CREATE TABLE IF NOT EXISTS challenges (nonce_hash text PRIMARY KEY, request_id uuid NOT NULL REFERENCES requests(id), subject text NOT NULL, decision text NOT NULL, reason text NOT NULL DEFAULT '', expires_at timestamptz NOT NULL, consumed_at timestamptz);
-CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at DESC,id DESC); CREATE INDEX IF NOT EXISTS decisions_created_idx ON decisions(created_at DESC,id DESC); CREATE INDEX IF NOT EXISTS jobs_due_idx ON jobs(status,run_after);`
+func New(db *pgxpool.Pool) *Store {
+	return &Store{
+		db: db,
+		beginDecisionTx: func(ctx context.Context) (decisionTx, error) {
+			return db.Begin(ctx)
+		},
+	}
+}
+
+// AppendAuditEvent is the only write operation exposed for Audit Events. The
+// database role and trigger enforce the same append-only guarantee below the
+// application boundary.
+func (s *Store) AppendAuditEvent(ctx context.Context, event audit.Event) error {
+	return appendAuditEvent(ctx, s.db, event)
+}
+
+type execer interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func appendAuditEvent(ctx context.Context, db execer, event audit.Event) error {
+	if event.SchemaVersion == 0 {
+		event.SchemaVersion = audit.EventSchemaVersion
+	}
+	if event.OperationID == "" {
+		event.OperationID = uuid.NewString()
+	}
+	if event.RequestID == "" {
+		event.RequestID = uuid.NewString()
+	}
+	if event.OccurredAt.IsZero() {
+		event.OccurredAt = time.Now().UTC()
+	}
+	if event.Metadata == nil {
+		event.Metadata = json.RawMessage(`{}`)
+	}
+	if !json.Valid(event.Metadata) || len(event.Metadata) > 16<<10 {
+		return fmt.Errorf("audit metadata must be valid JSON no larger than 16 KiB")
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(event.Metadata, &metadata); err != nil || metadata == nil {
+		return fmt.Errorf("audit metadata must be a JSON object")
+	}
+	if len(event.UserAgent) > 512 {
+		event.UserAgent = truncateUTF8(event.UserAgent, 512)
+	}
+	if _, err := uuid.Parse(event.OperationID); err != nil {
+		return fmt.Errorf("audit operation ID: %w", err)
+	}
+	if _, err := uuid.Parse(event.RequestID); err != nil {
+		return fmt.Errorf("audit request ID: %w", err)
+	}
+	rolesValue := event.ActorRoles
+	if rolesValue == nil {
+		rolesValue = []string{}
+	}
+	roles, err := json.Marshal(rolesValue)
+	if err != nil {
+		return fmt.Errorf("audit actor roles: %w", err)
+	}
+	_, err = db.Exec(ctx, `INSERT INTO audit_events
+		(occurred_at,schema_version,operation_id,request_id,actor_id,actor_name,actor_type,actor_roles,
+		 action_code,outcome,auth_method,permission,policy_version,reason,resource_type,resource_id,
+		 ip_address,user_agent,route,metadata)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		event.OccurredAt.UTC(), event.SchemaVersion, event.OperationID, event.RequestID,
+		event.ActorID, event.ActorName, event.ActorType, roles, event.ActionCode, event.Outcome,
+		event.AuthMethod, event.Permission, event.PolicyVersion, event.Reason, event.ResourceType,
+		event.ResourceID, event.IPAddress, event.UserAgent, event.Route, event.Metadata)
+	return err
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+type auditCursor struct {
+	OccurredAt time.Time `json:"t"`
+	ID         int64     `json:"i"`
+}
+
+func decodeAuditCursor(raw string) (auditCursor, error) {
+	if raw == "" {
+		return auditCursor{}, nil
+	}
+	if len(raw) > 512 {
+		return auditCursor{}, fmt.Errorf("audit cursor is too long")
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return auditCursor{}, fmt.Errorf("invalid audit cursor")
+	}
+	var c auditCursor
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&c); err != nil || decoder.Decode(&struct{}{}) != io.EOF || c.ID < 1 || c.OccurredAt.IsZero() {
+		return auditCursor{}, fmt.Errorf("invalid audit cursor")
+	}
+	return c, nil
+}
+
+// ValidateAuditCursor checks a client-provided keyset cursor without querying
+// the database. HTTP handlers use this to classify malformed cursors as bad
+// requests rather than database/read failures.
+func ValidateAuditCursor(raw string) error {
+	_, err := decodeAuditCursor(raw)
+	return err
+}
+
+func encodeAuditCursor(c auditCursor) string {
+	b, _ := json.Marshal(c)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ListAuditEvents uses a deterministic newest-first keyset. It deliberately
+// accepts only the finite filter set in audit.Query; arbitrary JSON metadata
+// predicates are not part of the read API.
+func (s *Store) ListAuditEvents(ctx context.Context, q audit.Query) (audit.Page, error) {
+	if q.Limit < 1 {
+		q.Limit = 50
+	}
+	if q.Limit > 100 {
+		return audit.Page{}, fmt.Errorf("audit page size exceeds maximum")
+	}
+	cursor, err := decodeAuditCursor(q.Cursor)
+	if err != nil {
+		return audit.Page{}, err
+	}
+	var operation any
+	if strings.TrimSpace(q.OperationID) != "" {
+		if _, err = uuid.Parse(q.OperationID); err != nil {
+			return audit.Page{}, fmt.Errorf("invalid operation ID")
+		}
+		operation = q.OperationID
+	} else {
+		// Keep the absent value NULL: casting an empty string to uuid would
+		// fail before PostgreSQL can evaluate the OR predicate.
+		operation = nil
+	}
+	var cursorTime any = nil
+	var cursorID any = nil
+	if !cursor.OccurredAt.IsZero() {
+		cursorTime, cursorID = cursor.OccurredAt, cursor.ID
+	}
+	rows, err := s.db.Query(ctx, `SELECT id,occurred_at,schema_version,operation_id,request_id,
+		actor_id,actor_name,actor_type,actor_roles,action_code,outcome,auth_method,permission,
+		policy_version,reason,resource_type,resource_id,ip_address,user_agent,route,metadata
+		FROM audit_events
+		WHERE ($1::timestamptz IS NULL OR (occurred_at,id) < ($1,$2))
+		  AND ($3='' OR action_code=$3) AND ($4='' OR outcome=$4)
+		  AND ($5='' OR actor_id=$5) AND ($6='' OR resource_type=$6)
+		  AND ($7='' OR resource_id=$7) AND ($8::uuid IS NULL OR operation_id=$8::uuid)
+		  AND ($9::timestamptz IS NULL OR occurred_at >= $9)
+		  AND ($10::timestamptz IS NULL OR occurred_at <= $10)
+		ORDER BY occurred_at DESC,id DESC LIMIT $11`, cursorTime, cursorID, q.Action,
+		string(q.Outcome), q.ActorID, q.ResourceType, q.ResourceID, operation, q.From, q.To, q.Limit+1)
+	if err != nil {
+		return audit.Page{}, err
+	}
+	defer rows.Close()
+	items := make([]audit.Event, 0, q.Limit)
+	for rows.Next() {
+		var e audit.Event
+		var roles []byte
+		if err = rows.Scan(&e.ID, &e.OccurredAt, &e.SchemaVersion, &e.OperationID, &e.RequestID,
+			&e.ActorID, &e.ActorName, &e.ActorType, &roles, &e.ActionCode, &e.Outcome,
+			&e.AuthMethod, &e.Permission, &e.PolicyVersion, &e.Reason, &e.ResourceType,
+			&e.ResourceID, &e.IPAddress, &e.UserAgent, &e.Route, &e.Metadata); err != nil {
+			return audit.Page{}, err
+		}
+		if err = json.Unmarshal(roles, &e.ActorRoles); err != nil {
+			return audit.Page{}, fmt.Errorf("audit actor roles are malformed: %w", err)
+		}
+		items = append(items, e)
+	}
+	if err = rows.Err(); err != nil {
+		return audit.Page{}, err
+	}
+	next := ""
+	if len(items) > q.Limit {
+		last := items[q.Limit-1]
+		next = encodeAuditCursor(auditCursor{OccurredAt: last.OccurredAt, ID: last.ID})
+		items = items[:q.Limit]
+	}
+	return audit.Page{Items: items, NextCursor: next}, nil
+}
+
+// CheckSchemaVersion verifies that the standalone migration step has made the
+// minimum schema available. It deliberately performs no DDL: a server started
+// before migration, or against an uninitialized database, must fail closed.
+func (s *Store) CheckSchemaVersion(ctx context.Context, minimum int64) error {
+	var version int64
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(max(version_id) FILTER (WHERE is_applied), 0) FROM goose_db_version`).Scan(&version)
+	if err != nil {
+		return fmt.Errorf("schema version unavailable: %w", err)
+	}
+	if version < minimum {
+		return fmt.Errorf("schema version %d is below required version %d", version, minimum)
+	}
+	return nil
+}
 
 type Session struct {
 	ID, Subject, Name, CSRFHash    string
+	Roles                          []string
 	CreatedAt, LastSeen, ExpiresAt time.Time
 }
 
 func hash(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }
-func (s *Store) CreateSession(ctx context.Context, subject, name, csrf string, now time.Time, idle, absolute time.Duration) (Session, error) {
-	x := Session{ID: uuid.NewString(), Subject: subject, Name: name, CSRFHash: hash(csrf), CreatedAt: now, LastSeen: now, ExpiresAt: now.Add(absolute)}
-	_, e := s.db.Exec(ctx, `INSERT INTO sessions(id,subject,name,csrf_hash,created_at,last_seen,expires_at) VALUES($1,$2,$3,$4,$5,$5,$6)`, x.ID, x.Subject, x.Name, x.CSRFHash, x.CreatedAt, x.ExpiresAt)
+func (s *Store) CreateSession(ctx context.Context, subject, name, csrf string, roles []string, now time.Time, idle, absolute time.Duration) (Session, error) {
+	normalized := authz.NormalizeRoles(roles)
+	roleStrings := make([]string, len(normalized))
+	for i, role := range normalized {
+		roleStrings[i] = string(role)
+	}
+	x := Session{ID: uuid.NewString(), Subject: subject, Name: name, Roles: roleStrings, CSRFHash: hash(csrf), CreatedAt: now, LastSeen: now, ExpiresAt: now.Add(absolute)}
+	rolesJSON, e := json.Marshal(x.Roles)
+	if e != nil {
+		return x, e
+	}
+	_, e = s.db.Exec(ctx, `INSERT INTO sessions(id,subject,name,roles_json,csrf_hash,created_at,last_seen,expires_at) VALUES($1,$2,$3,$4,$5,$6,$6,$7)`, x.ID, x.Subject, x.Name, rolesJSON, x.CSRFHash, x.CreatedAt, x.ExpiresAt)
 	return x, e
 }
 func (s *Store) GetSession(ctx context.Context, id string, now time.Time, idle time.Duration) (Session, error) {
 	var x Session
-	err := s.db.QueryRow(ctx, `SELECT id,subject,name,csrf_hash,created_at,last_seen,expires_at FROM sessions WHERE id=$1`, id).Scan(&x.ID, &x.Subject, &x.Name, &x.CSRFHash, &x.CreatedAt, &x.LastSeen, &x.ExpiresAt)
+	var rolesJSON []byte
+	err := s.db.QueryRow(ctx, `SELECT id,subject,name,roles_json,csrf_hash,created_at,last_seen,expires_at FROM sessions WHERE id=$1`, id).Scan(&x.ID, &x.Subject, &x.Name, &rolesJSON, &x.CSRFHash, &x.CreatedAt, &x.LastSeen, &x.ExpiresAt)
 	if err != nil {
 		return x, err
+	}
+	if err = json.Unmarshal(rolesJSON, &x.Roles); err != nil {
+		return x, fmt.Errorf("session roles are malformed: %w", err)
 	}
 	if now.Sub(x.LastSeen) > idle || now.After(x.ExpiresAt) {
 		_, _ = s.db.Exec(ctx, `DELETE FROM sessions WHERE id=$1`, id)
@@ -68,22 +296,14 @@ func (s *Store) CreateOAuthState(ctx context.Context, state, verifier, nonce, re
 }
 func (s *Store) ConsumeOAuthState(ctx context.Context, state string, now time.Time) (OAuthState, error) {
 	var x OAuthState
-	tx, e := s.db.Begin(ctx)
-	if e != nil {
-		return x, e
+	// DELETE ... RETURNING atomically consumes the state and requires only the
+	// runtime role's existing SELECT/DELETE grants. SELECT ... FOR UPDATE would
+	// additionally require UPDATE on oauth_states.
+	err := s.db.QueryRow(ctx, `DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at >= $2 RETURNING id,state_hash,verifier,nonce_hash,redirect_uri,created_at,expires_at`, hash(state), now).Scan(&x.ID, &x.StateHash, &x.Verifier, &x.NonceHash, &x.RedirectURI, &x.CreatedAt, &x.ExpiresAt)
+	if err != nil {
+		return x, fmt.Errorf("oauth state consume: %w", err)
 	}
-	defer tx.Rollback(ctx)
-	e = tx.QueryRow(ctx, `SELECT id,state_hash,verifier,nonce_hash,redirect_uri,created_at,expires_at FROM oauth_states WHERE state_hash=$1 FOR UPDATE`, hash(state)).Scan(&x.ID, &x.StateHash, &x.Verifier, &x.NonceHash, &x.RedirectURI, &x.CreatedAt, &x.ExpiresAt)
-	if e != nil {
-		return x, e
-	}
-	if now.After(x.ExpiresAt) {
-		return x, fmt.Errorf("oauth state expired")
-	}
-	if _, e = tx.Exec(ctx, `DELETE FROM oauth_states WHERE id=$1`, x.ID); e != nil {
-		return x, e
-	}
-	return x, tx.Commit(ctx)
+	return x, nil
 }
 
 type Request struct {
@@ -288,7 +508,24 @@ func (s *Store) RequestEvidence(ctx context.Context, id string) ([]Decision, err
 
 // AcceptDecision atomically enforces first valid reviewer, no self approval, and a single winning decision.
 func (s *Store) AcceptDecision(ctx context.Context, requestID, reviewerSubject, reviewerName, decision, reason, nonceHash string, statement []byte, signature string) (Decision, error) {
-	tx, e := s.db.Begin(ctx)
+	return s.acceptDecision(ctx, requestID, reviewerSubject, reviewerName, decision, reason, nonceHash, statement, signature, nil)
+}
+
+// AcceptDecisionWithAudit atomically accepts a decision and appends the supplied
+// success event. The event is inserted through the same transaction as every
+// business mutation, so either the complete decision lifecycle commits or all
+// of it rolls back. Failure events must be appended separately after this
+// method returns an error.
+func (s *Store) AcceptDecisionWithAudit(ctx context.Context, requestID, reviewerSubject, reviewerName, decision, reason, nonceHash string, statement []byte, signature string, successEvent audit.Event) (Decision, error) {
+	return s.acceptDecision(ctx, requestID, reviewerSubject, reviewerName, decision, reason, nonceHash, statement, signature, &successEvent)
+}
+
+func (s *Store) acceptDecision(ctx context.Context, requestID, reviewerSubject, reviewerName, decision, reason, nonceHash string, statement []byte, signature string, successEvent *audit.Event) (Decision, error) {
+	begin := s.beginDecisionTx
+	if begin == nil {
+		begin = func(ctx context.Context) (decisionTx, error) { return s.db.Begin(ctx) }
+	}
+	tx, e := begin(ctx)
 	if e != nil {
 		return Decision{}, e
 	}
@@ -338,6 +575,11 @@ func (s *Store) AcceptDecision(ctx context.Context, requestID, reviewerSubject, 
 	}
 	if _, e = tx.Exec(ctx, `INSERT INTO jobs(id,kind,request_id,payload,run_after) VALUES($1,'publish', $2, $3, now())`, uuid.New(), requestID, statement); e != nil {
 		return d, e
+	}
+	if successEvent != nil {
+		if e = appendAuditEvent(ctx, tx, *successEvent); e != nil {
+			return d, e
+		}
 	}
 	return d, tx.Commit(ctx)
 }
