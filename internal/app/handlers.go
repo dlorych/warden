@@ -154,6 +154,67 @@ func readAuditEvent(actor audit.Event, outcome audit.Outcome, reason, resourceID
 	return actor
 }
 
+func authAuditEvent(actor audit.Event, action string, outcome audit.Outcome, reason string) audit.Event {
+	actor.ActionCode = action
+	actor.Outcome = outcome
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	return actor
+}
+
+func requestListAuditEvent(actor audit.Event, outcome audit.Outcome, reason string) audit.Event {
+	actor.ActionCode = audit.ActionRequestList
+	actor.Outcome = outcome
+	actor.Permission = string(authz.RequestRead)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	actor.ResourceType = "deployment_request"
+	return actor
+}
+
+func decisionListAuditEvent(actor audit.Event, outcome audit.Outcome, reason string) audit.Event {
+	actor.ActionCode = audit.ActionDecisionList
+	actor.Outcome = outcome
+	actor.Permission = string(authz.DecisionRead)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	actor.ResourceType = "decision"
+	return actor
+}
+
+func evidenceAuditEvent(actor audit.Event, outcome audit.Outcome, reason, resourceID string) audit.Event {
+	actor.ActionCode = audit.ActionEvidenceRead
+	actor.Outcome = outcome
+	actor.Permission = string(authz.EvidenceRead)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	actor.ResourceType = "deployment_request"
+	actor.ResourceID = resourceID
+	return actor
+}
+
+func browserActor(r *http.Request, s store.Session, authenticated bool) audit.Event {
+	if authenticated {
+		return auditActor(s.Subject, s.Name, s.Roles, audit.ActorUser)
+	}
+	return auditActor("", "", nil, audit.ActorAnonymous)
+}
+
+// operationForState gives initiation and callback the same correlation UUID
+// without storing raw state in an event or log. SHA-256 is only used as a
+// deterministic UUID derivation; the state itself remains a secret.
+func operationForState(state string) string {
+	digest := sha256.Sum256([]byte(state))
+	id := uuid.UUID(digest[:16])
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id.String()
+}
+
+func preparedAuditEvent(r *http.Request, event audit.Event, status int) audit.Event {
+	return prepareAuditEvent(r, event, status)
+}
+
 func (a *App) browserSessionFailureReason(r *http.Request) string {
 	if _, err := r.Cookie(a.sessionCookieName()); err != nil {
 		return "session_missing"
@@ -640,31 +701,58 @@ type cliIdentityKey struct{}
 
 func (a *App) requireCLI(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		permission, resourceAware := cliPermission(r.URL.Path)
+		resourceID := chi.URLParam(r, "id")
+		unauthenticated := func(reason string, status int, title string) {
+			event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, reason, resourceID)
+			if a.failAudit(w, r, event, status) {
+				writeProblem(w, status, title)
+			}
+		}
 		if _, cookieErr := r.Cookie(a.sessionCookieName()); cookieErr == nil {
-			writeProblem(w, 401, "Cookies are not accepted by the CLI API")
+			unauthenticated("cookie_not_allowed", http.StatusUnauthorized, "Cookies are not accepted by the CLI API")
 			return
 		}
 		h := r.Header.Get("Authorization")
-		if !strings.HasPrefix(h, "Bearer ") {
-			writeProblem(w, 401, "Bearer token required")
+		if h == "" {
+			unauthenticated("bearer_missing", http.StatusUnauthorized, "Bearer token required")
+			return
+		}
+		if !strings.HasPrefix(h, "Bearer ") || strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")) == "" {
+			unauthenticated("bearer_malformed", http.StatusUnauthorized, "Bearer token required")
+			return
+		}
+		if a.Auth == nil {
+			event := cliAuditEvent(nil, permission, audit.OutcomeFailed, "authentication_unavailable", resourceID)
+			if a.failAudit(w, r, event, http.StatusServiceUnavailable) {
+				writeProblem(w, http.StatusServiceUnavailable, "Authentication unavailable")
+			}
 			return
 		}
 		id, e := a.Auth.VerifyAccessToken(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
 		if e != nil {
-			writeProblem(w, 401, "Invalid access token")
+			event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, "bearer_invalid", resourceID)
+			if a.failAudit(w, r, event, http.StatusUnauthorized) {
+				writeProblem(w, http.StatusUnauthorized, "Invalid access token")
+			}
 			return
 		}
-		action, resourceAware := cliPermission(r.URL.Path)
 		if resourceAware {
 			// This coarse gate prevents non-reviewers from reaching a decision
 			// handler. The handler's final Authorize call still needs the
 			// request owner and is the only terminal authorization decision.
 			if !authz.HasRole(authz.Principal{Subject: id.Subject, Roles: rolesFromStrings(id.Roles)}, authz.RoleReviewer) {
-				writeProblem(w, http.StatusNotFound, "Resource not found")
+				event := cliAuditEvent(&id, permission, audit.OutcomeDenied, authz.ReasonRoleMissing, resourceID)
+				if a.failAudit(w, r, event, http.StatusNotFound) {
+					writeProblem(w, http.StatusNotFound, "Resource not found")
+				}
 				return
 			}
-		} else if !a.allows(id.Roles, id.Subject, action, authz.Resource{RequestID: chi.URLParam(r, "id")}) {
-			writeProblem(w, http.StatusNotFound, "Resource not found")
+		} else if decision := a.authorize(id.Roles, id.Subject, permission, authz.Resource{RequestID: resourceID}); !decision.Allowed {
+			event := cliAuditEvent(&id, permission, audit.OutcomeDenied, decision.Reason, resourceID)
+			if a.failAudit(w, r, event, http.StatusNotFound) {
+				writeProblem(w, http.StatusNotFound, "Resource not found")
+			}
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cliIdentityKey{}, id)))
@@ -682,6 +770,77 @@ func cliPermission(path string) (authz.Permission, bool) {
 		return authz.DecisionPrepare, true
 	}
 	return authz.RequestRead, false
+}
+
+func cliAction(permission authz.Permission) string {
+	switch permission {
+	case authz.RequestRead:
+		return audit.ActionRequestRead
+	case authz.EvidenceRead:
+		return audit.ActionEvidenceRead
+	case authz.DecisionPrepare:
+		return audit.ActionDecisionPrepare
+	case authz.DecisionAdd:
+		return audit.ActionDecisionAdd
+	default:
+		return string(permission)
+	}
+}
+
+func cliAuditEvent(id *auth.Identity, permission authz.Permission, outcome audit.Outcome, reason, resourceID string) audit.Event {
+	event := audit.Event{
+		ActionCode:    cliAction(permission),
+		Outcome:       outcome,
+		AuthMethod:    "bearer",
+		Permission:    string(permission),
+		PolicyVersion: authz.PolicyVersion,
+		Reason:        reason,
+		ResourceType:  "deployment_request",
+		ResourceID:    resourceID,
+		ActorType:     audit.ActorAnonymous,
+	}
+	if id != nil && id.Subject != "" {
+		event.ActorID = id.Subject
+		event.ActorName = id.Name
+		event.ActorRoles = append([]string(nil), id.Roles...)
+		event.ActorType = audit.ActorUser
+	}
+	return event
+}
+
+func decisionAuditMetadata(decision string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"decision":%q}`, decision))
+}
+
+func auditPersistenceFailure(err error) bool {
+	var marker interface{ AuditAppendFailure() bool }
+	return errors.As(err, &marker) && marker.AuditAppendFailure()
+}
+
+func (a *App) cliProblem(w http.ResponseWriter, r *http.Request, event audit.Event, status int, title string) {
+	if a.failAudit(w, r, event, status) {
+		writeProblem(w, status, title)
+	}
+}
+
+func decisionMutationFailure(err error) (audit.Outcome, string, int, string) {
+	if auditPersistenceFailure(err) {
+		return audit.OutcomeFailed, "audit_append_failed", http.StatusServiceUnavailable, "Audit service unavailable"
+	}
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return audit.OutcomeInvalid, "request_not_found", http.StatusNotFound, "Request not found"
+	case err != nil && err.Error() == "reviewer cannot approve own request":
+		return audit.OutcomeDenied, authz.ReasonSelfApproval, http.StatusNotFound, "Request not found"
+	case err != nil && err.Error() == "request expired":
+		return audit.OutcomeInvalid, "request_expired", http.StatusConflict, "request is not eligible for a decision"
+	case err != nil && err.Error() == "request already decided":
+		return audit.OutcomeInvalid, "request_already_decided", http.StatusConflict, "request is not eligible for a decision"
+	case err != nil && (err.Error() == "challenge is invalid or expired" || err.Error() == "challenge is invalid or already consumed"):
+		return audit.OutcomeInvalid, "challenge_invalid", http.StatusConflict, "challenge is invalid or expired"
+	default:
+		return audit.OutcomeFailed, "decision_commit_failed", http.StatusInternalServerError, "Could not record decision"
+	}
 }
 func identity(r *http.Request) auth.Identity {
 	return r.Context().Value(cliIdentityKey{}).(auth.Identity)
@@ -702,21 +861,38 @@ func rolesFromStrings(roles []string) []authz.Role {
 }
 func (a *App) apiRequest(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	actor := identity(r)
 	if _, e := uuid.Parse(id); e != nil {
-		writeProblem(w, 404, "Request not found")
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.RequestRead, audit.OutcomeInvalid, "request_id_invalid", id), http.StatusNotFound, "Request not found")
 		return
 	}
 	x, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
-		writeProblem(w, 404, "Request not found")
+		outcome, reason, status, title := audit.OutcomeInvalid, "request_not_found", http.StatusNotFound, "Request not found"
+		if !errors.Is(e, pgx.ErrNoRows) {
+			outcome, reason, status, title = audit.OutcomeFailed, "request_read_failed", http.StatusInternalServerError, "Could not read request"
+		}
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.RequestRead, outcome, reason, id), status, title)
+		return
+	}
+	if !a.failAudit(w, r, cliAuditEvent(&actor, authz.RequestRead, audit.OutcomeSuccess, "read", id), http.StatusOK) {
 		return
 	}
 	writeJSON(w, 200, dto(x))
 }
 func (a *App) apiEvidence(w http.ResponseWriter, r *http.Request) {
-	d, e := a.Store.RequestEvidence(r.Context(), chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+	actor := identity(r)
+	if _, e := uuid.Parse(id); e != nil {
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.EvidenceRead, audit.OutcomeInvalid, "request_id_invalid", id), http.StatusNotFound, "Evidence not found")
+		return
+	}
+	d, e := a.Store.RequestEvidence(r.Context(), id)
 	if e != nil {
-		writeProblem(w, 500, "Could not read evidence")
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.EvidenceRead, audit.OutcomeFailed, "evidence_read_failed", id), http.StatusInternalServerError, "Could not read evidence")
+		return
+	}
+	if !a.failAudit(w, r, cliAuditEvent(&actor, authz.EvidenceRead, audit.OutcomeSuccess, "read", id), http.StatusOK) {
 		return
 	}
 	if len(d) == 1 && len(d[0].Statement) > 0 {
@@ -728,33 +904,42 @@ func (a *App) apiEvidence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": d})
 }
 func (a *App) challenge(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	actor := identity(r)
 	// Load and authorize the target first so resource denial is indistinguishable
 	// from a missing request, even when the submitted challenge body is invalid.
-	x, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	x, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
-		writeProblem(w, 404, "Request not found")
+		outcome, reason, status, title := audit.OutcomeInvalid, "request_not_found", http.StatusNotFound, "Request not found"
+		if !errors.Is(e, pgx.ErrNoRows) {
+			outcome, reason, status, title = audit.OutcomeFailed, "request_lookup_failed", http.StatusInternalServerError, "Could not read request"
+		}
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionPrepare, outcome, reason, id), status, title)
 		return
 	}
-	if !a.allows(identity(r).Roles, identity(r).Subject, authz.DecisionPrepare, authz.Resource{RequestID: x.ID, RequesterSubject: x.RequesterSubject}) {
-		writeProblem(w, http.StatusNotFound, "Request not found")
+	if decision := a.authorize(actor.Roles, actor.Subject, authz.DecisionPrepare, authz.Resource{RequestID: x.ID, RequesterSubject: x.RequesterSubject}); !decision.Allowed {
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionPrepare, audit.OutcomeDenied, decision.Reason, id), http.StatusNotFound, "Request not found")
 		return
+	}
+	invalid := func(reason, title string, status int) {
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionPrepare, audit.OutcomeInvalid, reason, id), status, title)
 	}
 	var in struct {
 		Decision string `json:"decision"`
 		Reason   string `json:"reason"`
 	}
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Decision != "approved" && in.Decision != "rejected" {
-		writeProblem(w, 400, "decision must be approved or rejected")
+		invalid("decision_invalid", "decision must be approved or rejected", http.StatusBadRequest)
 		return
 	}
 	if in.Decision == "rejected" {
 		if strings.TrimSpace(in.Reason) == "" {
-			writeProblem(w, 400, "reason is required for rejection")
+			invalid("reason_required", "reason is required for rejection", http.StatusBadRequest)
 			return
 		}
 	}
 	if x.Decision != "pending" || time.Now().After(x.ExpiresAt) {
-		writeProblem(w, 409, "request is not eligible for a challenge")
+		invalid("request_not_eligible", "request is not eligible for a challenge", http.StatusConflict)
 		return
 	}
 	nonce := randomToken(24)
@@ -762,90 +947,125 @@ func (a *App) challenge(w http.ResponseWriter, r *http.Request) {
 	expiry := time.Now().Add(5 * time.Minute).UTC()
 	digest := sha256.Sum256(x.Context)
 	statement := evidence.Statement{Version: evidence.StatementVersion, Service: "wardenv", RequestID: x.ID, ContextDigest: "sha256:" + hex.EncodeToString(digest[:]), Decision: decision, Reason: in.Reason, Subject: identity(r).Subject, Nonce: nonce, Expiry: expiry.Unix()}
-	if e := a.Store.CreateChallenge(r.Context(), x.ID, identity(r).Subject, decision, in.Reason, hashValue(nonce), expiry); e != nil {
-		writeProblem(w, 500, "could not create challenge")
+	successEvent := cliAuditEvent(&actor, authz.DecisionPrepare, audit.OutcomeSuccess, "challenge_created", id)
+	successEvent.Metadata = decisionAuditMetadata(decision)
+	successEvent = prepareAuditEvent(r, successEvent, http.StatusOK)
+	if e := a.Store.CreateChallengeWithAudit(r.Context(), x.ID, actor.Subject, decision, in.Reason, hashValue(nonce), expiry, successEvent); e != nil {
+		failureEvent := successEvent
+		failureEvent.Outcome = audit.OutcomeFailed
+		failureEvent.Metadata = nil
+		if auditPersistenceFailure(e) {
+			a.logAuditFailure(successEvent, e)
+			failureEvent.Reason = "audit_append_failed"
+			a.cliProblem(w, r, failureEvent, http.StatusServiceUnavailable, "Audit service unavailable")
+			return
+		}
+		failureEvent.Reason = "challenge_create_failed"
+		a.cliProblem(w, r, failureEvent, http.StatusInternalServerError, "Could not create challenge")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"statement": statement, "challenge": statement})
 }
 func (a *App) decide(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	actor := identity(r)
 	// Resolve and authorize the target before parsing untrusted evidence. This
 	// keeps missing, unauthorized, and self-owned resources on the same 404
 	// path and prevents request existence disclosure through validation errors.
-	reqForDecision, e := a.Store.GetRequest(r.Context(), chi.URLParam(r, "id"))
+	reqForDecision, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
-		writeProblem(w, 404, "Request not found")
+		outcome, reason, status, title := audit.OutcomeInvalid, "request_not_found", http.StatusNotFound, "Request not found"
+		if !errors.Is(e, pgx.ErrNoRows) {
+			outcome, reason, status, title = audit.OutcomeFailed, "request_lookup_failed", http.StatusInternalServerError, "Could not read request"
+		}
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionAdd, outcome, reason, id), status, title)
 		return
 	}
-	if !a.allows(identity(r).Roles, identity(r).Subject, authz.DecisionAdd, authz.Resource{RequestID: reqForDecision.ID, RequesterSubject: reqForDecision.RequesterSubject}) {
-		writeProblem(w, http.StatusNotFound, "Request not found")
+	if decision := a.authorize(actor.Roles, actor.Subject, authz.DecisionAdd, authz.Resource{RequestID: reqForDecision.ID, RequesterSubject: reqForDecision.RequesterSubject}); !decision.Allowed {
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionAdd, audit.OutcomeDenied, decision.Reason, id), http.StatusNotFound, "Request not found")
 		return
+	}
+	invalid := func(reason, title string) {
+		a.cliProblem(w, r, cliAuditEvent(&actor, authz.DecisionAdd, audit.OutcomeInvalid, reason, id), http.StatusBadRequest, title)
 	}
 	var bundle evidence.Bundle
 	body, eRead := io.ReadAll(r.Body)
 	if eRead != nil || json.Unmarshal(body, &bundle) != nil || bundle.Signed.Statement.RequestID == "" {
-		writeProblem(w, 400, "invalid JSON")
+		invalid("invalid_json", "invalid JSON")
 		return
 	}
 	statementJSON, _ := json.Marshal(bundle.Signed.Statement)
 	decision := bundle.Signed.Statement.Decision
 	reason := bundle.Signed.Statement.Reason
 	if len(bundle.CertificateChain) == 0 {
-		writeProblem(w, 400, "certificate-backed evidence bundle is required")
+		invalid("certificate_missing", "certificate-backed evidence bundle is required")
 		return
 	}
 	certs, e := parseCerts(bundle.CertificateChain)
 	if e != nil || len(certs) == 0 {
-		writeProblem(w, 400, "invalid evidence certificate chain")
+		invalid("certificate_invalid", "invalid evidence certificate chain")
 		return
 	}
 	pub, ok := certs[0].PublicKey.(*ecdsa.PublicKey)
 	if !ok || bundle.Signed.VerifySignature(pub) != nil {
-		writeProblem(w, 400, "invalid evidence signature")
+		invalid("signature_invalid", "invalid evidence signature")
 		return
 	}
 	if err := a.verifyEvidenceCertificate(certs, identity(r).Subject); err != nil {
-		writeProblem(w, 400, "untrusted evidence certificate")
+		invalid("certificate_untrusted", "untrusted evidence certificate")
 		return
 	}
 	if decision != "approved" && decision != "rejected" {
-		writeProblem(w, 400, "decision must be approved or rejected")
+		invalid("decision_invalid", "decision must be approved or rejected")
 		return
 	}
 	if decision == "rejected" && strings.TrimSpace(reason) == "" {
-		writeProblem(w, 400, "reason is required for rejection")
+		invalid("reason_required", "reason is required for rejection")
 		return
 	}
 	if len(statementJSON) == 0 || strings.TrimSpace(bundle.Signed.Signature) == "" {
-		writeProblem(w, 400, "signed evidence is required")
+		invalid("signed_evidence_missing", "signed evidence is required")
 		return
 	}
 	var st evidence.Statement
 	if e := json.Unmarshal(statementJSON, &st); e != nil {
-		writeProblem(w, 400, "invalid signed statement")
+		invalid("statement_invalid", "invalid signed statement")
 		return
 	}
 	ctxDigest := sha256.Sum256(reqForDecision.Context)
 	if st.ContextDigest != "sha256:"+hex.EncodeToString(ctxDigest[:]) || st.Service != "wardenv" {
-		writeProblem(w, 400, "statement context binding mismatch")
+		invalid("statement_context_mismatch", "statement context binding mismatch")
 		return
 	}
-	if st.RequestID != chi.URLParam(r, "id") || st.Subject != identity(r).Subject {
-		writeProblem(w, 400, "statement binding mismatch")
+	if st.RequestID != id || st.Subject != actor.Subject {
+		invalid("statement_binding_mismatch", "statement binding mismatch")
 		return
 	}
 	expected := st.Decision
 	if expected != decision || st.Reason != reason || st.Expiry < time.Now().Unix() {
-		writeProblem(w, 400, "statement binding mismatch")
+		invalid("statement_binding_mismatch", "statement binding mismatch")
 		return
 	}
 	if _, e := evidence.CanonicalStatement(st); e != nil {
-		writeProblem(w, 400, "invalid signed statement")
+		invalid("statement_invalid", "invalid signed statement")
 		return
 	}
-	d, e := a.Store.AcceptDecision(r.Context(), chi.URLParam(r, "id"), identity(r).Subject, identity(r).Name, decision, reason, hashValue(st.Nonce), body, bundle.Signed.Signature)
+	successEvent := cliAuditEvent(&actor, authz.DecisionAdd, audit.OutcomeSuccess, "decision_committed", id)
+	successEvent.Metadata = decisionAuditMetadata(decision)
+	successEvent = prepareAuditEvent(r, successEvent, http.StatusAccepted)
+	d, e := a.Store.AcceptDecisionWithAudit(r.Context(), id, actor.Subject, actor.Name, decision, reason, hashValue(st.Nonce), body, bundle.Signed.Signature, successEvent)
 	if e != nil {
-		writeProblem(w, 409, e.Error())
+		if auditPersistenceFailure(e) {
+			a.logAuditFailure(successEvent, e)
+		}
+		outcome, failureReason, status, title := decisionMutationFailure(e)
+		failureEvent := successEvent
+		failureEvent.Outcome = outcome
+		failureEvent.Reason = failureReason
+		if !a.failAudit(w, r, failureEvent, status) {
+			return
+		}
+		writeProblem(w, status, title)
 		return
 	}
 	writeJSON(w, 202, decisionDTO{ID: d.ID, RequestID: d.RequestID, Decision: d.Decision, Reason: d.Reason, CreatedAt: d.CreatedAt, Statement: d.Statement, Signature: d.Signature})
