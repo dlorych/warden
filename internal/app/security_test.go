@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,9 @@ import (
 	"github.com/wardenv/service/internal/auth"
 	"github.com/wardenv/service/internal/authz"
 	"github.com/wardenv/service/internal/source"
+	"github.com/wardenv/service/internal/store"
 	"github.com/wardenv/service/pkg/evidence"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -154,17 +157,160 @@ func (f fakeSource) Webhook(context.Context, []byte, string) (source.Event, erro
 }
 func (f fakeSource) Recheck(context.Context, source.Event) (bool, error)         { return true, nil }
 func (f fakeSource) Deliver(context.Context, source.Event, string, string) error { return nil }
+
+type successfulWebhookSource struct {
+	event source.Event
+	err   error
+}
+
+func (s successfulWebhookSource) Webhook(context.Context, []byte, string) (source.Event, error) {
+	return s.event, s.err
+}
+func (successfulWebhookSource) Recheck(context.Context, source.Event) (bool, error) { return true, nil }
+func (successfulWebhookSource) Deliver(context.Context, source.Event, string, string) error {
+	return nil
+}
+
 func TestWebhookAdapterErrorMapping(t *testing.T) {
 	for _, tc := range []struct {
 		err    error
 		status int
 	}{{source.ErrInvalidSignature, 401}, {source.ErrIgnored, 204}, {source.ErrMalformed, 400}, {source.ErrUpstream, 502}} {
-		a := &App{Source: fakeSource{tc.err}}
+		a := &App{Source: fakeSource{tc.err}, Audit: &fakeAuditRepository{}}
 		rr := httptest.NewRecorder()
 		a.githubWebhook(rr, httptest.NewRequest(http.MethodPost, "/webhooks/github", nil))
 		if rr.Code != tc.status {
 			t.Fatalf("error %v status %d want %d", tc.err, rr.Code, tc.status)
 		}
+	}
+}
+
+func TestWebhookInvalidSignatureIsUnauthenticated(t *testing.T) {
+	repo := &fakeAuditRepository{}
+	a := &App{Source: fakeSource{err: source.ErrInvalidSignature}, Audit: repo}
+	rr := httptest.NewRecorder()
+	a.githubWebhook(rr, httptest.NewRequest(http.MethodPost, "/webhooks/github", nil))
+	if rr.Code != http.StatusUnauthorized || len(repo.events) != 1 {
+		t.Fatalf("status=%d events=%d, want 401/1", rr.Code, len(repo.events))
+	}
+	if repo.events[0].Outcome != audit.OutcomeUnauthenticated {
+		t.Fatalf("outcome=%q, want unauthenticated", repo.events[0].Outcome)
+	}
+}
+
+func TestWebhookAuditKeepsInvalidSignatureAnonymous(t *testing.T) {
+	repo := &fakeAuditRepository{}
+	a := &App{Source: fakeSource{err: source.ErrInvalidSignature}, Audit: repo}
+	r := httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(`{"actor":"payload-attacker"}`))
+	r.Header.Set("X-GitHub-Delivery", "11111111-1111-4111-8111-111111111111")
+	r.Header.Set("X-Hub-Signature-256", "sha256=forged")
+	r.Header.Set("X-Actor", "header-attacker")
+	rr := httptest.NewRecorder()
+	a.githubWebhook(rr, r)
+	if rr.Code != http.StatusUnauthorized || len(repo.events) != 1 {
+		t.Fatalf("status=%d events=%d, want 401/1", rr.Code, len(repo.events))
+	}
+	event := repo.events[0]
+	if event.ActionCode != audit.ActionRequestAdd || event.Outcome != audit.OutcomeUnauthenticated || event.Reason != "signature_invalid" || event.ActorType != audit.ActorAnonymous || event.ActorID != "" || event.ActorName != "" {
+		t.Fatalf("invalid signature event trusted identity or wrong classification: %#v", event)
+	}
+	if !strings.Contains(string(event.Metadata), "delivery_id") || strings.Contains(string(event.Metadata), "payload-attacker") || strings.Contains(string(event.Metadata), "forged") || strings.Contains(string(event.Metadata), "header-attacker") {
+		t.Fatalf("unsafe webhook metadata survived: %s", event.Metadata)
+	}
+}
+
+func TestWebhookRetriesAppendDistinctEventsWhenRequestIsIdempotent(t *testing.T) {
+	repo := &fakeAuditRepository{}
+	a := &App{
+		Source: successfulWebhookSource{event: source.Event{ID: "11111111-1111-4111-8111-111111111111", Repository: "acme/app", Environment: "production", CommitSHA: "abc", Requester: "payload-user", RequesterSubject: "payload-subject", Context: []byte(`{"safe":true}`)}},
+		Audit:  repo,
+	}
+	a.enqueueWebhookWithAudit = func(ctx context.Context, request store.Request, event audit.Event) error {
+		// This emulates the Store transaction: ON CONFLICT suppresses the
+		// business duplicate, while the event is still appended every time.
+		return repo.AppendAuditEvent(ctx, event)
+	}
+	for _, delivery := range []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
+		r := httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(`{"signed":true}`))
+		r.Header.Set("X-GitHub-Delivery", delivery)
+		rr := httptest.NewRecorder()
+		a.githubWebhook(rr, r)
+		if rr.Code != http.StatusAccepted {
+			t.Fatalf("delivery %s status=%d, want 202", delivery, rr.Code)
+		}
+	}
+	if len(repo.events) != 2 {
+		t.Fatalf("events=%d, want one Audit Event per delivery", len(repo.events))
+	}
+	if repo.events[0].OperationID == repo.events[1].OperationID || repo.events[0].RequestID == repo.events[1].RequestID {
+		t.Fatalf("retry events collapsed correlation: %#v %#v", repo.events[0], repo.events[1])
+	}
+	for _, event := range repo.events {
+		if event.ActorType != audit.ActorWebhook || event.ActorID != githubSourceSubject || event.Permission != string(authz.RequestAdd) || event.ActionCode != audit.ActionRequestAdd || event.Outcome != audit.OutcomeSuccess || event.Reason != "request_accepted" {
+			t.Fatalf("source event did not use internal source principal: %#v", event)
+		}
+	}
+}
+
+func TestWebhookAuditFailureReturns503AndAppendsFailureAfterRollback(t *testing.T) {
+	repo := &fakeAuditRepository{}
+	var logs bytes.Buffer
+	a := &App{
+		Source: successfulWebhookSource{event: source.Event{ID: "11111111-1111-4111-8111-111111111111", Repository: "acme/app", Environment: "production", CommitSHA: "abc", Context: []byte(`{"safe":true}`)}},
+		Audit:  repo,
+		logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	a.enqueueWebhookWithAudit = func(context.Context, store.Request, audit.Event) error {
+		return &store.AuditAppendError{Err: errors.New("audit unavailable")}
+	}
+	rr := httptest.NewRecorder()
+	a.githubWebhook(rr, httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(`{"signed":true}`)))
+	if rr.Code != http.StatusServiceUnavailable || len(repo.events) != 1 {
+		t.Fatalf("status=%d events=%d, want 503/1 failure event", rr.Code, len(repo.events))
+	}
+	if event := repo.events[0]; event.Outcome != audit.OutcomeFailed || event.Reason != "audit_append_failed" || event.ActionCode != audit.ActionRequestAdd {
+		t.Fatalf("failure event=%#v", event)
+	}
+	if !strings.Contains(logs.String(), "emergency=true") || !strings.Contains(logs.String(), "action=request.add") {
+		t.Fatalf("missing emergency audit failure log: %q", logs.String())
+	}
+}
+
+type denyWebhookAuthorizer struct {
+	request authz.Request
+}
+
+func (d *denyWebhookAuthorizer) Authorize(request authz.Request) authz.Decision {
+	d.request = request
+	return authz.Decision{Permission: request.Permission, PolicyVersion: authz.PolicyVersion, Reason: authz.ReasonRoleMissing}
+}
+
+func TestWebhookUsesAuthorizerAndRecordsDenial(t *testing.T) {
+	repo := &fakeAuditRepository{}
+	policy := &denyWebhookAuthorizer{}
+	a := &App{
+		Source: successfulWebhookSource{event: source.Event{ID: "11111111-1111-4111-8111-111111111111"}},
+		Audit:  repo,
+		Policy: policy,
+	}
+	rr := httptest.NewRecorder()
+	a.githubWebhook(rr, httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(`{"signed":true}`)))
+	if rr.Code != http.StatusForbidden || len(repo.events) != 1 {
+		t.Fatalf("status=%d events=%d, want 403/1", rr.Code, len(repo.events))
+	}
+	if policy.request.Permission != authz.RequestAdd || policy.request.Principal.Subject != githubSourceSubject || !authz.HasRole(policy.request.Principal, authz.RoleSource) {
+		t.Fatalf("authorization request=%#v", policy.request)
+	}
+	event := repo.events[0]
+	if event.Outcome != audit.OutcomeDenied || event.Reason != authz.ReasonRoleMissing || event.Permission != string(authz.RequestAdd) || event.PolicyVersion != authz.PolicyVersion {
+		t.Fatalf("denial event=%#v", event)
+	}
+}
+
+func TestAuditRepositoryDoesNotUseWebhookTransactionSeam(t *testing.T) {
+	a := &App{enqueueWebhookWithAudit: func(context.Context, store.Request, audit.Event) error { return nil }}
+	if a.auditRepository() != nil {
+		t.Fatal("webhook transaction seam fabricated an audit repository")
 	}
 }
 

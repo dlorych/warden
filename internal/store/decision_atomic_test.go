@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,10 @@ type decisionTxStub struct {
 	auditAction     string
 	auditOutcome    audit.Outcome
 	auditPermission string
+	auditMetadata   json.RawMessage
+	auditInserts    int
+	requestRows     int64
+	requestRowsSet  bool
 	auditErr        error
 	challengeErr    error
 	jobErr          error
@@ -33,6 +39,7 @@ type decisionTxStub struct {
 func (s *decisionTxStub) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	s.execQueries = append(s.execQueries, query)
 	if strings.Contains(query, "INSERT INTO audit_events") {
+		s.auditInserts++
 		if len(args) > 8 {
 			s.auditAction, _ = args[8].(string)
 		}
@@ -42,9 +49,15 @@ func (s *decisionTxStub) Exec(_ context.Context, query string, args ...any) (pgc
 		if len(args) > 11 {
 			s.auditPermission, _ = args[11].(string)
 		}
+		if len(args) > 19 {
+			s.auditMetadata, _ = args[19].(json.RawMessage)
+		}
 		if s.auditErr != nil {
 			return pgconn.CommandTag{}, s.auditErr
 		}
+	}
+	if strings.Contains(query, "INSERT INTO requests") && s.requestRowsSet {
+		return pgconn.NewCommandTag(fmt.Sprintf("INSERT %d", s.requestRows)), nil
 	}
 	if strings.Contains(query, "INSERT INTO challenges") && s.challengeErr != nil {
 		return pgconn.CommandTag{}, s.challengeErr

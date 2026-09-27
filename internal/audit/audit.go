@@ -22,6 +22,7 @@ const (
 	ActionEvidenceRead    = "evidence.read"
 	ActionDecisionPrepare = "decision.prepare"
 	ActionDecisionAdd     = "decision.add"
+	ActionRequestAdd      = "request.add"
 )
 
 type ActorType string

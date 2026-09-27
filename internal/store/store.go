@@ -707,3 +707,88 @@ func (s *Store) EnqueueWebhook(ctx context.Context, r Request) error {
 	_, e := s.db.Exec(ctx, `INSERT INTO requests(id,repository,environment,commit_sha,requester,requester_subject,context,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO NOTHING`, r.ID, r.Repository, r.Environment, r.CommitSHA, r.Requester, r.RequesterSubject, r.Context, r.CreatedAt, r.ExpiresAt)
 	return e
 }
+
+// EnqueueWebhookWithAudit commits source request creation (including an
+// idempotent duplicate suppression) and its successful request.add Audit Event
+// in one transaction. A failed append rolls back the request mutation, while
+// callers append a separate failure event after this method returns.
+func (s *Store) EnqueueWebhookWithAudit(ctx context.Context, r Request, successEvent audit.Event) error {
+	_, err := s.enqueueWebhookWithAuditResult(ctx, r, successEvent)
+	return err
+}
+
+// enqueueWebhookWithAuditResult is the transaction implementation. The
+// boolean is intentionally used only to annotate bounded audit metadata; the
+// webhook response never exposes source/request details.
+func (s *Store) enqueueWebhookWithAuditResult(ctx context.Context, r Request, successEvent audit.Event) (bool, error) {
+	begin := s.beginDecisionTx
+	if begin == nil {
+		begin = func(ctx context.Context) (decisionTx, error) { return s.db.Begin(ctx) }
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	insertTag, err := tx.Exec(ctx, `INSERT INTO requests(id,repository,environment,commit_sha,requester,requester_subject,context,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO NOTHING`, r.ID, r.Repository, r.Environment, r.CommitSHA, r.Requester, r.RequesterSubject, r.Context, r.CreatedAt, r.ExpiresAt)
+	if err != nil {
+		return false, err
+	}
+	created := insertTag.RowsAffected() == 1
+	successEvent.Metadata = webhookRequestStateMetadata(successEvent.Metadata, created)
+	if err = appendAuditEvent(ctx, tx, successEvent); err != nil {
+		return false, &AuditAppendError{Err: err}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return created, err
+	}
+	return created, nil
+}
+
+func webhookRequestStateMetadata(raw json.RawMessage, created bool) json.RawMessage {
+	metadata := map[string]json.RawMessage{}
+	var input map[string]json.RawMessage
+	if json.Unmarshal(raw, &input) == nil {
+		for _, key := range []string{"http_status", "delivery_id", "idempotency_key"} {
+			value, ok := input[key]
+			if !ok {
+				continue
+			}
+			if key == "http_status" {
+				var status int
+				if json.Unmarshal(value, &status) == nil && status >= 100 && status <= 599 {
+					metadata[key] = value
+				}
+				continue
+			}
+			var correlation string
+			if json.Unmarshal(value, &correlation) == nil && safeWebhookCorrelation(correlation) {
+				metadata[key] = json.RawMessage(fmt.Sprintf("%q", correlation))
+			}
+		}
+	}
+	state := "existing"
+	if created {
+		state = "created"
+	}
+	metadata["request_state"] = json.RawMessage(fmt.Sprintf("%q", state))
+	value, err := json.Marshal(metadata)
+	if err != nil || len(value) > 512 {
+		// The caller supplies only bounded, allowlisted metadata. Keep this
+		// fallback deterministic if that contract ever changes.
+		return json.RawMessage(fmt.Sprintf(`{"request_state":%q}`, state))
+	}
+	return value
+}
+
+func safeWebhookCorrelation(value string) bool {
+	if value == "" || len(value) > 128 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == ':') {
+			return false
+		}
+	}
+	return true
+}

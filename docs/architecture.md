@@ -104,6 +104,16 @@ source context as opaque bytes. Warden persists those bytes and passes them
 back to the adapter; it does not interpret provider-specific fields in the
 approval path.
 
+Webhook ingestion audits every observed outcome under `request.add`. Before
+signature verification, the actor is anonymous; after a valid HMAC, the
+adapter is represented by a fixed internal `source` principal and the
+default-deny authorizer records the `request.add` permission decision. Request
+creation and its successful Audit Event commit in one transaction. Deterministic
+request IDs make retries idempotent for the request row, while each delivery
+still appends a distinct event with only bounded correlation and request-state
+metadata. Payloads, signatures, provider identity fields, and source context
+are never copied into audit metadata or logs.
+
 ## Identity, signing, and transparency
 
 Keycloak is the OIDC boundary for this MVP. Enterprise SAML or Active

@@ -121,17 +121,29 @@ func safeAuditMetadata(raw json.RawMessage, status int) json.RawMessage {
 	allowed := map[string]any{"http_status": status}
 	var input map[string]json.RawMessage
 	if json.Unmarshal(raw, &input) == nil {
-		for _, key := range []string{"returned", "decision"} {
+		for _, key := range []string{"returned", "decision", "delivery_id", "idempotency_key", "request_state"} {
 			if value, ok := input[key]; ok {
 				if key == "returned" {
 					var n int
 					if json.Unmarshal(value, &n) == nil && n >= 0 && n <= 100 {
 						allowed[key] = n
 					}
-				} else {
+				} else if key == "decision" {
 					var decision string
 					if json.Unmarshal(value, &decision) == nil && (decision == "approved" || decision == "rejected") {
 						allowed[key] = decision
+					}
+				} else if key == "request_state" {
+					var state string
+					if json.Unmarshal(value, &state) == nil && (state == "created" || state == "existing") {
+						allowed[key] = state
+					}
+				} else {
+					var correlation string
+					if json.Unmarshal(value, &correlation) == nil {
+						if correlation = safeCorrelationValue(correlation); correlation != "" {
+							allowed[key] = correlation
+						}
 					}
 				}
 			}
@@ -785,7 +797,7 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 	if q.Action != "" && !validAuditFilterValue(q.Action, 128) || q.ActorID != "" && !validAuditFilterValue(q.ActorID, 256) || q.ResourceType != "" && !validAuditFilterValue(q.ResourceType, 128) || q.ResourceID != "" && !validAuditFilterValue(q.ResourceID, 256) {
 		return audit.Query{}, fmt.Errorf("invalid audit filter")
 	}
-	if q.Action != "" && q.Action != audit.ActionAuthLogin && q.Action != audit.ActionAuthLogout && q.Action != audit.ActionRequestList && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionDecisionList && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != "audit.initialized" {
+	if q.Action != "" && q.Action != audit.ActionAuthLogin && q.Action != audit.ActionAuthLogout && q.Action != audit.ActionRequestList && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionDecisionList && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != audit.ActionRequestAdd && q.Action != "audit.initialized" {
 		return audit.Query{}, fmt.Errorf("invalid audit action")
 	}
 	if raw := values.Get("limit"); raw != "" {
@@ -1329,33 +1341,191 @@ func (a *App) verifyEvidenceCertificate(certs []*x509.Certificate, subject strin
 	return e
 }
 
+const (
+	webhookBodyLimit       = 1 << 20
+	githubSourceSubject    = "source:github"
+	webhookSourceAuth      = "hmac"
+	webhookResourceType    = "deployment_request"
+	webhookDeliveryHeader  = "X-GitHub-Delivery"
+	webhookIdempotencyHead = "Idempotency-Key"
+)
+
+// githubWebhook is the source boundary. The only actor identity it accepts is
+// the fixed, internal GitHub source principal after the adapter has validated
+// the signature. Payload and header values never become an Audit Event actor.
 func (a *App) githubWebhook(w http.ResponseWriter, r *http.Request) {
-	raw, e := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if e != nil {
-		writeProblem(w, 400, "invalid body")
+	metadata := webhookCorrelationMetadata(r)
+	anonymous := webhookAuditActor(false)
+	raw, readErr := io.ReadAll(io.LimitReader(r.Body, webhookBodyLimit+1))
+	if readErr != nil || len(raw) > webhookBodyLimit {
+		reason, status, title := "body_read_failed", http.StatusBadRequest, "invalid body"
+		if len(raw) > webhookBodyLimit {
+			reason, status, title = "body_too_large", http.StatusRequestEntityTooLarge, "request body too large"
+		}
+		event := webhookAuditEvent(anonymous, audit.OutcomeInvalid, reason, metadata)
+		if !a.failAudit(w, r, event, status) {
+			return
+		}
+		writeProblem(w, status, title)
 		return
 	}
-	ev, e := a.Source.Webhook(r.Context(), raw, r.Header.Get("X-Hub-Signature-256"))
-	if e != nil {
-		if errors.Is(e, source.ErrInvalidSignature) {
-			writeProblem(w, 401, "invalid webhook signature")
+
+	if a.Source == nil {
+		event := webhookAuditEvent(anonymous, audit.OutcomeFailed, "source_unavailable", metadata)
+		if !a.failAudit(w, r, event, http.StatusServiceUnavailable) {
 			return
 		}
-		if errors.Is(e, source.ErrIgnored) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if errors.Is(e, source.ErrUpstream) {
-			writeProblem(w, 502, "could not enrich workflow run")
-			return
-		}
-		writeProblem(w, 400, e.Error())
+		writeProblem(w, http.StatusServiceUnavailable, "Webhook source unavailable")
 		return
 	}
-	if e = a.Store.EnqueueWebhook(r.Context(), store.Request{ID: ev.ID, Repository: ev.Repository, Environment: ev.Environment, CommitSHA: ev.CommitSHA, Requester: ev.Requester, RequesterSubject: ev.RequesterSubject, Context: ev.Context, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(24 * time.Hour)}); e != nil {
-		writeProblem(w, 500, "could not store request")
+	ev, sourceErr := a.Source.Webhook(r.Context(), raw, r.Header.Get("X-Hub-Signature-256"))
+	if sourceErr != nil {
+		actor := anonymous
+		// The source adapter verifies the signature before classifying these
+		// source outcomes. Keep all other errors anonymous: no adapter error
+		// is allowed to assert an actor identity.
+		if errors.Is(sourceErr, source.ErrIgnored) || errors.Is(sourceErr, source.ErrMalformed) || errors.Is(sourceErr, source.ErrUpstream) {
+			actor = webhookAuditActor(true)
+		}
+		outcome, reason, status, title := classifyWebhookError(sourceErr)
+		event := webhookAuditEvent(actor, outcome, reason, metadata)
+		if !a.failAudit(w, r, event, status) {
+			return
+		}
+		if status == http.StatusNoContent {
+			w.WriteHeader(status)
+		} else {
+			writeProblem(w, status, title)
+		}
+		return
+	}
+
+	actor := webhookAuditActor(true)
+	decision := a.authorize([]string{string(authz.RoleSource)}, githubSourceSubject, authz.RequestAdd, authz.Resource{})
+	if !decision.Allowed {
+		event := webhookAuditEvent(actor, audit.OutcomeDenied, decision.Reason, metadata)
+		applyWebhookAuthorizationEvidence(&event, decision)
+		if !a.failAudit(w, r, event, http.StatusForbidden) {
+			return
+		}
+		writeProblem(w, http.StatusForbidden, "Webhook source is not authorized")
+		return
+	}
+
+	// Prepare the event once so an atomic-store failure can be represented by a
+	// distinct failure outcome for this same delivery correlation.
+	success := webhookAuditEvent(actor, audit.OutcomeSuccess, "request_accepted", metadata)
+	applyWebhookAuthorizationEvidence(&success, decision)
+	success.ResourceID = safeResourceID(ev.ID)
+	success = preparedAuditEvent(r, success, http.StatusAccepted)
+	request := store.Request{ID: ev.ID, Repository: ev.Repository, Environment: ev.Environment, CommitSHA: ev.CommitSHA, Requester: ev.Requester, RequesterSubject: ev.RequesterSubject, Context: ev.Context, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(24 * time.Hour)}
+	if a.Store == nil && a.enqueueWebhookWithAudit == nil {
+		failure := success
+		failure.Outcome = audit.OutcomeFailed
+		failure.Reason = "request_store_unavailable"
+		if !a.failAudit(w, r, failure, http.StatusServiceUnavailable) {
+			return
+		}
+		writeProblem(w, http.StatusServiceUnavailable, "Request service unavailable")
+		return
+	}
+	var enqueueErr error
+	if a.enqueueWebhookWithAudit != nil {
+		enqueueErr = a.enqueueWebhookWithAudit(r.Context(), request, success)
+	} else {
+		enqueueErr = a.Store.EnqueueWebhookWithAudit(r.Context(), request, success)
+	}
+	if err := enqueueErr; err != nil {
+		failure := success
+		failure.Outcome = audit.OutcomeFailed
+		status, title := http.StatusInternalServerError, "Could not store request"
+		failure.Reason = "request_store_failed"
+		if auditPersistenceFailure(err) {
+			// The successful event was attempted inside the rolled-back
+			// transaction. Preserve the emergency process-level signal even if
+			// the separate failure event append below succeeds.
+			a.logAuditFailure(success, err)
+			status, title = http.StatusServiceUnavailable, "Audit service unavailable"
+			failure.Reason = "audit_append_failed"
+		}
+		// The store transaction has rolled back before this event is appended.
+		// This event is deliberately outside that transaction and records the
+		// failed attempt without exposing source payload details.
+		if !a.failAudit(w, r, failure, status) {
+			return
+		}
+		writeProblem(w, status, title)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func webhookAuditActor(verified bool) audit.Event {
+	if !verified {
+		return audit.Event{ActorType: audit.ActorAnonymous, AuthMethod: webhookSourceAuth}
+	}
+	return audit.Event{ActorID: githubSourceSubject, ActorName: "GitHub", ActorType: audit.ActorWebhook, ActorRoles: []string{string(authz.RoleSource)}, AuthMethod: webhookSourceAuth}
+}
+
+func webhookAuditEvent(actor audit.Event, outcome audit.Outcome, reason string, metadata json.RawMessage) audit.Event {
+	actor.ActionCode = audit.ActionRequestAdd
+	actor.Outcome = outcome
+	actor.Permission = string(authz.RequestAdd)
+	actor.PolicyVersion = authz.PolicyVersion
+	actor.Reason = reason
+	actor.ResourceType = webhookResourceType
+	actor.Metadata = metadata
+	return actor
+}
+
+func applyWebhookAuthorizationEvidence(event *audit.Event, decision authz.Decision) {
+	if decision.Permission != "" {
+		event.Permission = string(decision.Permission)
+	}
+	if decision.PolicyVersion != "" {
+		event.PolicyVersion = decision.PolicyVersion
+	}
+}
+
+func classifyWebhookError(err error) (audit.Outcome, string, int, string) {
+	switch {
+	case errors.Is(err, source.ErrInvalidSignature):
+		return audit.OutcomeUnauthenticated, "signature_invalid", http.StatusUnauthorized, "invalid webhook signature"
+	case errors.Is(err, source.ErrIgnored):
+		return audit.OutcomeInvalid, "event_ignored", http.StatusNoContent, ""
+	case errors.Is(err, source.ErrMalformed):
+		return audit.OutcomeInvalid, "payload_malformed", http.StatusBadRequest, "malformed webhook"
+	case errors.Is(err, source.ErrUpstream):
+		return audit.OutcomeFailed, "source_upstream_failed", http.StatusBadGateway, "could not enrich workflow run"
+	default:
+		return audit.OutcomeFailed, "source_processing_failed", http.StatusBadGateway, "could not process webhook"
+	}
+}
+
+func webhookCorrelationMetadata(r *http.Request) json.RawMessage {
+	allowed := make(map[string]string, 2)
+	if value := safeCorrelationValue(r.Header.Get(webhookDeliveryHeader)); value != "" {
+		allowed["delivery_id"] = value
+	}
+	if value := safeCorrelationValue(r.Header.Get(webhookIdempotencyHead)); value != "" {
+		allowed["idempotency_key"] = value
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(allowed)
+	return b
+}
+
+func safeCorrelationValue(value string) string {
+	if len(value) == 0 || len(value) > 128 || !utf8.ValidString(value) {
+		return ""
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':') {
+			return ""
+		}
+	}
+	return value
 }
 func hashValue(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }

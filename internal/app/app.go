@@ -25,6 +25,9 @@ type App struct {
 	Source source.Adapter
 	Audit  audit.Repository
 	logger *slog.Logger
+	// enqueueWebhookWithAudit is a narrow test seam around the transactional
+	// source mutation. Production uses Store directly.
+	enqueueWebhookWithAudit func(context.Context, store.Request, audit.Event) error
 }
 
 func New(ctx context.Context, cfg Config, logger *slog.Logger) (*App, error) {
