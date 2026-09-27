@@ -1,7 +1,7 @@
 package app
 
 import (
-	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,69 +9,158 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/wardenv/service/internal/audit"
+	"github.com/wardenv/service/internal/auth"
 	"github.com/wardenv/service/internal/authz"
 )
 
 func cliRequest(method, path string) *http.Request {
-	r := httptest.NewRequest(method, path, nil)
-	ctx := chi.NewRouteContext()
-	ctx.URLParams.Add("id", "request-id")
-	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, ctx))
+	return httptest.NewRequest(method, path, nil)
 }
 
 func TestRequireCLIRecordsIntendedActionForUnauthenticatedRequests(t *testing.T) {
 	for _, test := range []struct {
-		name, path, reason string
+		name, path, reason, resourceType, action string
+		method, header                           string
+		cookie                                   bool
 	}{
-		{name: "missing bearer", path: "/requests/request-id", reason: "bearer_missing"},
-		{name: "malformed bearer", path: "/requests/request-id", reason: "bearer_malformed"},
-		{name: "empty bearer", path: "/requests/request-id", reason: "bearer_malformed"},
-		{name: "cookie", path: "/requests/request-id/challenges", reason: "cookie_not_allowed"},
+		{name: "missing request bearer", method: http.MethodGet, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111", reason: "bearer_missing", resourceType: "deployment_request", action: audit.ActionRequestRead},
+		{name: "malformed request bearer", method: http.MethodGet, header: "Basic abc", path: "/api/v1/requests/11111111-1111-4111-8111-111111111111", reason: "bearer_malformed", resourceType: "deployment_request", action: audit.ActionRequestRead},
+		{name: "empty request bearer", method: http.MethodGet, header: "Bearer   ", path: "/api/v1/requests/11111111-1111-4111-8111-111111111111", reason: "bearer_malformed", resourceType: "deployment_request", action: audit.ActionRequestRead},
+		{name: "missing challenge bearer", method: http.MethodPost, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111/challenges", reason: "bearer_missing", resourceType: "deployment_decision", action: audit.ActionDecisionPrepare},
+		{name: "missing decision bearer", method: http.MethodPost, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111/decisions", reason: "bearer_missing", resourceType: "deployment_decision", action: audit.ActionDecisionAdd},
+		{name: "missing evidence bearer", method: http.MethodGet, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111/evidence", reason: "bearer_missing", resourceType: "protected_evidence", action: audit.ActionEvidenceRead},
+		{name: "cookie challenge", method: http.MethodPost, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111/challenges", reason: "cookie_not_allowed", resourceType: "deployment_decision", action: audit.ActionDecisionPrepare, cookie: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repo := &fakeAuditRepository{}
 			a := &App{Audit: repo}
-			r := cliRequest(http.MethodGet, test.path)
-			if test.name == "malformed bearer" {
-				r.Header.Set("Authorization", "Basic abc")
+			r := cliRequest(test.method, test.path)
+			if test.header != "" {
+				r.Header.Set("Authorization", test.header)
 			}
-			if test.name == "empty bearer" {
-				r.Header.Set("Authorization", "Bearer   ")
-			}
-			if test.name == "cookie" {
+			if test.cookie {
 				r.AddCookie(&http.Cookie{Name: "warden_session", Value: "session"})
 			}
-			called := false
-			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })
 			rr := httptest.NewRecorder()
-			a.requireCLI(next).ServeHTTP(rr, r)
-			if called || rr.Code != http.StatusUnauthorized {
-				t.Fatalf("next=%v status=%d, want no next/401", called, rr.Code)
+			// Exercise the mounted router and route-scoped middleware.
+			a.Router().ServeHTTP(rr, r)
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d, want 401", rr.Code)
 			}
 			if len(repo.events) != 1 {
 				t.Fatalf("events=%d, want 1", len(repo.events))
 			}
 			event := repo.events[0]
-			wantAction := audit.ActionRequestRead
-			if test.name == "cookie" {
-				wantAction = audit.ActionDecisionPrepare
-			}
-			if event.ActionCode != wantAction || event.Permission != string(cliPermissionForTest(wantAction)) || event.Outcome != audit.OutcomeUnauthenticated || event.Reason != test.reason {
+			if event.ActionCode != test.action || event.Permission != string(permissionForAction(test.action)) || event.Outcome != audit.OutcomeUnauthenticated || event.Reason != test.reason {
 				t.Fatalf("event=%#v", event)
 			}
-			if event.AuthMethod != "bearer" || event.ActorType != audit.ActorAnonymous {
+			if event.AuthMethod != "bearer" || event.ActorType != audit.ActorAnonymous || event.ResourceID != "11111111-1111-4111-8111-111111111111" || event.ResourceType != test.resourceType {
 				t.Fatalf("authentication fields=%#v", event)
 			}
 		})
 	}
 }
 
-func cliPermissionForTest(action string) authz.Permission {
+func TestCLIRouterLeavesUnknownPathsAndMethodsUnaudited(t *testing.T) {
+	for _, test := range []struct {
+		name, method, path string
+		status             int
+	}{
+		{name: "unknown path", method: http.MethodGet, path: "/api/v1/not-a-route", status: http.StatusNotFound},
+		{name: "method mismatch", method: http.MethodPost, path: "/api/v1/requests/11111111-1111-4111-8111-111111111111", status: http.StatusMethodNotAllowed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &fakeAuditRepository{}
+			a := &App{Audit: repo}
+			rr := httptest.NewRecorder()
+			a.Router().ServeHTTP(rr, cliRequest(test.method, test.path))
+			if rr.Code != test.status {
+				t.Fatalf("status=%d, want %d", rr.Code, test.status)
+			}
+			if len(repo.events) != 0 {
+				t.Fatalf("events=%d, want no audit event", len(repo.events))
+			}
+		})
+	}
+}
+
+func TestCLIAuditOmitsInvalidAttemptedRequestID(t *testing.T) {
+	for _, path := range []string{
+		"/api/v1/requests/not-a-uuid",
+		"/api/v1/requests/" + strings.Repeat("a", 5000),
+	} {
+		t.Run(path, func(t *testing.T) {
+			repo := &fakeAuditRepository{}
+			a := &App{Audit: repo}
+			r := cliRequest(http.MethodGet, path)
+			rr := httptest.NewRecorder()
+			a.Router().ServeHTTP(rr, r)
+			if rr.Code != http.StatusUnauthorized || len(repo.events) != 1 {
+				t.Fatalf("status=%d events=%d", rr.Code, len(repo.events))
+			}
+			if got := repo.events[0].ResourceID; got != "" {
+				t.Fatalf("resource ID=%q, want omitted", got)
+			}
+		})
+	}
+}
+
+func TestRequireCLIRecordsJWKSOutageAsOperationalFailure(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"issuer":   "http://" + r.Host,
+				"jwks_uri": "http://" + r.Host + "/keys",
+			})
+		case "/keys":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+
+	service := auth.New(auth.Config{OIDCIssuer: provider.URL, OIDCAudience: "warden-cli"})
+	if err := service.Discovery(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	repo := &fakeAuditRepository{}
+	a := &App{Auth: service, Audit: repo}
+	r := cliRequest(http.MethodGet, "/api/v1/requests/11111111-1111-4111-8111-111111111111")
+	r.Header.Set("Authorization", "Bearer "+testAccessToken())
+	rr := httptest.NewRecorder()
+	a.Router().ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", rr.Code)
+	}
+	if len(repo.events) != 1 {
+		t.Fatalf("events=%d, want 1", len(repo.events))
+	}
+	event := repo.events[0]
+	if event.Outcome != audit.OutcomeFailed || event.Reason != "authentication_unavailable" || event.ResourceID != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("event=%#v", event)
+	}
+}
+
+func testAccessToken() string {
+	encode := base64.RawURLEncoding.EncodeToString
+	header := encode([]byte(`{"alg":"RS256","kid":"missing"}`))
+	payload := encode([]byte(`{"iss":"https://issuer.example","sub":"reviewer","aud":"warden-cli","exp":4102444800,"scope":"warden:decide"}`))
+	signature := encode([]byte("signature"))
+	return header + "." + payload + "." + signature
+}
+
+func permissionForAction(action string) authz.Permission {
 	switch action {
+	case audit.ActionEvidenceRead:
+		return authz.EvidenceRead
 	case audit.ActionDecisionPrepare:
 		return authz.DecisionPrepare
+	case audit.ActionDecisionAdd:
+		return authz.DecisionAdd
 	default:
 		return authz.RequestRead
 	}

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,36 @@ func TestClassifyExchangeFailureDistinguishesInvalidAndOperational(t *testing.T)
 	if got := ClassifyExchangeFailure(&exchangeError{kind: ExchangeFailed, err: errJWKSOperational}); got != ExchangeFailed {
 		t.Fatalf("operational classification = %q", got)
 	}
+}
+
+func TestVerifyAccessTokenClassifiesJWKSOperationalFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/keys" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	s := New(Config{OIDCIssuer: "https://issuer.example", OIDCAudience: "warden-cli"})
+	s.meta.JWKSURI = server.URL + "/keys"
+	_, err := s.VerifyAccessToken(testAccessToken())
+	if err == nil || ClassifyAccessTokenFailure(err) != AccessTokenFailed {
+		t.Fatalf("error=%v classification=%q, want operational failure", err, ClassifyAccessTokenFailure(err))
+	}
+
+	if _, err := s.VerifyAccessToken("not-a-token"); err == nil || ClassifyAccessTokenFailure(err) != AccessTokenInvalid {
+		t.Fatalf("malformed token error=%v classification=%q, want invalid", err, ClassifyAccessTokenFailure(err))
+	}
+}
+
+func testAccessToken() string {
+	encode := base64.RawURLEncoding.EncodeToString
+	header := encode([]byte(`{"alg":"RS256","kid":"missing"}`))
+	payload := encode([]byte(`{"iss":"https://issuer.example","sub":"reviewer","aud":"warden-cli","exp":4102444800,"scope":"warden:decide"}`))
+	signature := encode([]byte("signature"))
+	return header + "." + payload + "." + signature
 }
 
 func TestExchangeClassifiesTokenAndProviderFailures(t *testing.T) {

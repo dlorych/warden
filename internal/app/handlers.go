@@ -908,87 +908,98 @@ func (a *App) selectAndAuditRead(r *http.Request, q audit.Query, actor audit.Eve
 func (a *App) apiRouter() http.Handler {
 	r := chiRouter()
 	r.Use(noStore)
-	r.Use(a.requireCLI)
-	r.Get("/requests/{id}", a.apiRequest)
-	r.Post("/requests/{id}/challenges", a.challenge)
-	r.Post("/requests/{id}/decisions", a.decide)
-	r.Get("/requests/{id}/evidence", a.apiEvidence)
+	r.With(a.requireCLI(authz.RequestRead, false)).Get("/requests/{id}", a.apiRequest)
+	r.With(a.requireCLI(authz.DecisionPrepare, true)).Post("/requests/{id}/challenges", a.challenge)
+	r.With(a.requireCLI(authz.DecisionAdd, true)).Post("/requests/{id}/decisions", a.decide)
+	r.With(a.requireCLI(authz.EvidenceRead, false)).Get("/requests/{id}/evidence", a.apiEvidence)
 	return r
 }
 
 type cliIdentityKey struct{}
 
-func (a *App) requireCLI(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		permission, resourceAware := cliPermission(r.URL.Path)
-		resourceID := chi.URLParam(r, "id")
-		unauthenticated := func(reason string, status int, title string) {
-			event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, reason, resourceID)
-			if a.failAudit(w, r, event, status) {
-				writeProblem(w, status, title)
+func (a *App) requireCLI(permission authz.Permission, resourceAware bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Route-scoped middleware runs after Chi has matched the endpoint and
+			// populated its route parameters. Canonicalize only the UUID-shaped
+			// resource identifier; invalid input is omitted from the Audit Event.
+			resourceID := canonicalCLIResourceID(chi.URLParam(r, "id"))
+			unauthenticated := func(reason string, status int, title string) {
+				event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, reason, resourceID)
+				if a.failAudit(w, r, event, status) {
+					writeProblem(w, status, title)
+				}
 			}
-		}
-		if _, cookieErr := r.Cookie(a.sessionCookieName()); cookieErr == nil {
-			unauthenticated("cookie_not_allowed", http.StatusUnauthorized, "Cookies are not accepted by the CLI API")
-			return
-		}
-		h := r.Header.Get("Authorization")
-		if h == "" {
-			unauthenticated("bearer_missing", http.StatusUnauthorized, "Bearer token required")
-			return
-		}
-		if !strings.HasPrefix(h, "Bearer ") || strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")) == "" {
-			unauthenticated("bearer_malformed", http.StatusUnauthorized, "Bearer token required")
-			return
-		}
-		if a.Auth == nil {
-			event := cliAuditEvent(nil, permission, audit.OutcomeFailed, "authentication_unavailable", resourceID)
-			if a.failAudit(w, r, event, http.StatusServiceUnavailable) {
-				writeProblem(w, http.StatusServiceUnavailable, "Authentication unavailable")
+			if _, cookieErr := r.Cookie(a.sessionCookieName()); cookieErr == nil {
+				unauthenticated("cookie_not_allowed", http.StatusUnauthorized, "Cookies are not accepted by the CLI API")
+				return
 			}
-			return
-		}
-		id, e := a.Auth.VerifyAccessToken(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
-		if e != nil {
-			event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, "bearer_invalid", resourceID)
-			if a.failAudit(w, r, event, http.StatusUnauthorized) {
-				writeProblem(w, http.StatusUnauthorized, "Invalid access token")
+			h := r.Header.Get("Authorization")
+			if h == "" {
+				unauthenticated("bearer_missing", http.StatusUnauthorized, "Bearer token required")
+				return
 			}
-			return
-		}
-		if resourceAware {
-			// This coarse gate prevents non-reviewers from reaching a decision
-			// handler. The handler's final Authorize call still needs the
-			// request owner and is the only terminal authorization decision.
-			if !authz.HasRole(authz.Principal{Subject: id.Subject, Roles: rolesFromStrings(id.Roles)}, authz.RoleReviewer) {
-				event := cliAuditEvent(&id, permission, audit.OutcomeDenied, authz.ReasonRoleMissing, resourceID)
+			if !strings.HasPrefix(h, "Bearer ") || strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")) == "" {
+				unauthenticated("bearer_malformed", http.StatusUnauthorized, "Bearer token required")
+				return
+			}
+			if a.Auth == nil {
+				event := cliAuditEvent(nil, permission, audit.OutcomeFailed, "authentication_unavailable", resourceID)
+				if a.failAudit(w, r, event, http.StatusServiceUnavailable) {
+					writeProblem(w, http.StatusServiceUnavailable, "Authentication unavailable")
+				}
+				return
+			}
+			id, e := a.Auth.VerifyAccessToken(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
+			if e != nil {
+				if auth.ClassifyAccessTokenFailure(e) == auth.AccessTokenFailed {
+					event := cliAuditEvent(nil, permission, audit.OutcomeFailed, "authentication_unavailable", resourceID)
+					if a.failAudit(w, r, event, http.StatusServiceUnavailable) {
+						writeProblem(w, http.StatusServiceUnavailable, "Authentication unavailable")
+					}
+					return
+				}
+				event := cliAuditEvent(nil, permission, audit.OutcomeUnauthenticated, "bearer_invalid", resourceID)
+				if a.failAudit(w, r, event, http.StatusUnauthorized) {
+					writeProblem(w, http.StatusUnauthorized, "Invalid access token")
+				}
+				return
+			}
+			if resourceAware {
+				// This coarse gate prevents non-reviewers from reaching a decision
+				// handler. The handler's final Authorize call still needs the
+				// request owner and is the only terminal authorization decision.
+				if !authz.HasRole(authz.Principal{Subject: id.Subject, Roles: rolesFromStrings(id.Roles)}, authz.RoleReviewer) {
+					event := cliAuditEvent(&id, permission, audit.OutcomeDenied, authz.ReasonRoleMissing, resourceID)
+					if a.failAudit(w, r, event, http.StatusNotFound) {
+						writeProblem(w, http.StatusNotFound, "Resource not found")
+					}
+					return
+				}
+			} else if decision := a.authorize(id.Roles, id.Subject, permission, authz.Resource{RequestID: resourceID}); !decision.Allowed {
+				event := cliAuditEvent(&id, permission, audit.OutcomeDenied, decision.Reason, resourceID)
 				if a.failAudit(w, r, event, http.StatusNotFound) {
 					writeProblem(w, http.StatusNotFound, "Resource not found")
 				}
 				return
 			}
-		} else if decision := a.authorize(id.Roles, id.Subject, permission, authz.Resource{RequestID: resourceID}); !decision.Allowed {
-			event := cliAuditEvent(&id, permission, audit.OutcomeDenied, decision.Reason, resourceID)
-			if a.failAudit(w, r, event, http.StatusNotFound) {
-				writeProblem(w, http.StatusNotFound, "Resource not found")
-			}
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cliIdentityKey{}, id)))
-	})
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cliIdentityKey{}, id)))
+		})
+	}
 }
 
-func cliPermission(path string) (authz.Permission, bool) {
-	if strings.HasSuffix(path, "/evidence") {
-		return authz.EvidenceRead, false
+func canonicalCLIResourceID(raw string) string {
+	// UUID text (including the accepted URN form) is well below this bound.
+	// Reject oversized input before handing it to the parser or retaining it in
+	// an event.
+	if len(raw) > 64 {
+		return ""
 	}
-	if strings.HasSuffix(path, "/decisions") {
-		return authz.DecisionAdd, true
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return ""
 	}
-	if strings.HasSuffix(path, "/challenges") {
-		return authz.DecisionPrepare, true
-	}
-	return authz.RequestRead, false
+	return id.String()
 }
 
 func cliAction(permission authz.Permission) string {
@@ -1021,7 +1032,7 @@ func cliAuditEvent(id *auth.Identity, permission authz.Permission, outcome audit
 		PolicyVersion: authz.PolicyVersion,
 		Reason:        reason,
 		ResourceType:  resourceType,
-		ResourceID:    resourceID,
+		ResourceID:    canonicalCLIResourceID(resourceID),
 		ActorType:     audit.ActorAnonymous,
 	}
 	if id != nil && id.Subject != "" {

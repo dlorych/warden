@@ -134,10 +134,7 @@ func TestHandlerAuthorizationUsesRolePrecheckAndResourceDenial(t *testing.T) {
 
 func TestCLIHandlersDeferTerminalDecisionAuthorizationUntilResourceLookup(t *testing.T) {
 	a := &App{Policy: authz.Policy{}}
-	action, resourceAware := cliPermission("/requests/request/challenges")
-	if action != authz.DecisionPrepare || !resourceAware {
-		t.Fatalf("challenge dispatch = %s, resourceAware=%v", action, resourceAware)
-	}
+	action := authz.DecisionPrepare
 	reviewer := authz.Principal{Subject: "reviewer-subject", Roles: []authz.Role{authz.RoleReviewer}}
 	if !authz.HasRole(reviewer, authz.RoleReviewer) {
 		t.Fatal("reviewer was rejected by coarse route gate")
@@ -147,9 +144,6 @@ func TestCLIHandlersDeferTerminalDecisionAuthorizationUntilResourceLookup(t *tes
 	}
 	if decision := a.authorize([]string{"reviewer"}, reviewer.Subject, action, authz.Resource{RequestID: "request", RequesterSubject: "requester-subject"}); !decision.Allowed {
 		t.Fatalf("valid reviewer was denied after resource lookup: %#v", decision)
-	}
-	if action, resourceAware := cliPermission("/requests/request"); action != authz.RequestRead || resourceAware {
-		t.Fatalf("request dispatch = %s, resourceAware=%v", action, resourceAware)
 	}
 }
 

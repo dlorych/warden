@@ -54,6 +54,35 @@ func ClassifyExchangeFailure(err error) ExchangeFailureKind {
 	return ExchangeInvalid
 }
 
+// AccessTokenFailureKind distinguishes a token that failed verification from
+// an operational failure while obtaining the key material needed to verify it.
+// Callers use this only to select a safe HTTP/audit outcome; the underlying
+// error is never exposed to the client.
+type AccessTokenFailureKind string
+
+const (
+	AccessTokenInvalid AccessTokenFailureKind = "invalid"
+	AccessTokenFailed  AccessTokenFailureKind = "failed"
+)
+
+type accessTokenError struct {
+	kind AccessTokenFailureKind
+	err  error
+}
+
+func (e *accessTokenError) Error() string { return e.err.Error() }
+func (e *accessTokenError) Unwrap() error { return e.err }
+
+// ClassifyAccessTokenFailure classifies VerifyAccessToken errors for safe
+// boundary outcomes. Unknown errors are treated as invalid by default.
+func ClassifyAccessTokenFailure(err error) AccessTokenFailureKind {
+	var classified *accessTokenError
+	if errors.As(err, &classified) {
+		return classified.kind
+	}
+	return AccessTokenInvalid
+}
+
 var errJWKSOperational = errors.New("oidc jwks operational failure")
 
 func hash(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }
@@ -284,7 +313,7 @@ func (s *Service) verify(raw, nonceHash string) (Identity, error) {
 func (s *Service) VerifyAccessToken(raw string) (Identity, error) {
 	id, e := s.verifyAccessClaims(raw, true)
 	if e != nil {
-		return Identity{}, e
+		return Identity{}, classifyAccessTokenError(e)
 	}
 	ok := false
 	for _, scope := range strings.Fields(id.scope) {
@@ -294,9 +323,17 @@ func (s *Service) VerifyAccessToken(raw string) (Identity, error) {
 		}
 	}
 	if !ok {
-		return Identity{}, fmt.Errorf("missing warden:decide scope")
+		return Identity{}, &accessTokenError{kind: AccessTokenInvalid, err: fmt.Errorf("missing warden:decide scope")}
 	}
 	return id, nil
+}
+
+func classifyAccessTokenError(err error) error {
+	kind := AccessTokenInvalid
+	if errors.Is(err, errJWKSOperational) {
+		kind = AccessTokenFailed
+	}
+	return &accessTokenError{kind: kind, err: err}
 }
 
 func (s *Service) verifyAccessClaims(raw string, requireAudience bool) (Identity, error) {
