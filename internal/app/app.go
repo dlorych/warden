@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/x509"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wardenv/service/internal/audit"
@@ -10,6 +12,7 @@ import (
 	"github.com/wardenv/service/internal/github"
 	"github.com/wardenv/service/internal/source"
 	"github.com/wardenv/service/internal/store"
+	"github.com/wardenv/service/pkg/evidence"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,6 +31,13 @@ type App struct {
 	// enqueueWebhookWithAudit is a narrow test seam around the transactional
 	// source mutation. Production uses Store directly.
 	enqueueWebhookWithAudit func(context.Context, store.Request, audit.Event) error
+	// Worker seams keep lifecycle tests Docker-independent while production
+	// continues to use Store and the concrete Rekor client.
+	workerGetRequest             func(context.Context, string) (store.Request, error)
+	workerSavePublishedAndMarkFn func(context.Context, string, []byte, audit.Event) error
+	workerSetStatusesFn          func(context.Context, string, string, string, audit.Event) error
+	workerRekorSubmit            func(context.Context, evidence.SignedDecision, *x509.Certificate) (*evidence.RekorProof, error)
+	workerVerifyPublicationFn    func(evidence.Bundle, *x509.CertPool, ed25519.PublicKey, string) error
 }
 
 func New(ctx context.Context, cfg Config, logger *slog.Logger) (*App, error) {

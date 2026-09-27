@@ -236,3 +236,34 @@ func TestAcceptDecisionWithAuditDoesNotAppendFailureEventWhenMutationFails(t *te
 		}
 	}
 }
+
+func TestSavePublishedAndMarkWithAuditCommitsBundleStateAndTerminalEventTogether(t *testing.T) {
+	tx := &decisionTxStub{}
+	terminal := validDecisionTestEvent()
+	terminal.ActionCode = audit.ActionTransparencyPublish
+	terminal.Permission = string(authz.TransparencyPublish)
+	terminal.Outcome = audit.OutcomeSuccess
+	if err := newDecisionTestStore(tx).SavePublishedAndMarkWithAudit(context.Background(), "request-id", []byte(`{"proof":true}`), terminal); err != nil {
+		t.Fatal(err)
+	}
+	if !tx.committed || len(tx.execQueries) != 3 || !strings.Contains(tx.execQueries[0], "published_bundle") || !strings.Contains(tx.execQueries[1], "log_status") || !strings.Contains(tx.execQueries[2], "audit_events") {
+		t.Fatalf("transaction writes=%q committed=%v", tx.execQueries, tx.committed)
+	}
+}
+
+func TestSetStatusesWithAuditRollsBackWhenTerminalAuditAppendFails(t *testing.T) {
+	auditErr := errors.New("audit unavailable")
+	tx := &decisionTxStub{auditErr: auditErr}
+	terminal := validDecisionTestEvent()
+	terminal.ActionCode = audit.ActionSourceDeliver
+	terminal.Permission = string(authz.SourceDeliver)
+	terminal.Outcome = audit.OutcomeSuccess
+	err := newDecisionTestStore(tx).SetStatusesWithAudit(context.Background(), "request-id", "", "delivered", terminal)
+	if !errors.Is(err, auditErr) {
+		t.Fatalf("error=%v, want audit error", err)
+	}
+	var marker *AuditAppendError
+	if !errors.As(err, &marker) || !marker.AuditAppendFailure() || tx.committed || !tx.rolledBack {
+		t.Fatalf("error=%v committed=%v rolledback=%v", err, tx.committed, tx.rolledBack)
+	}
+}

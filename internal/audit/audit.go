@@ -13,16 +13,25 @@ const EventSchemaVersion = 1
 // these values stable: they are part of the Audit Log contract consumed by
 // operators and downstream evidence tooling.
 const (
-	ActionAuthLogin       = "auth.login"
-	ActionAuthLogout      = "auth.logout"
-	ActionRequestList     = "request.list"
-	ActionRequestRead     = "request.read"
-	ActionAuditRead       = "audit.read"
-	ActionDecisionList    = "decision.list"
-	ActionEvidenceRead    = "evidence.read"
-	ActionDecisionPrepare = "decision.prepare"
-	ActionDecisionAdd     = "decision.add"
-	ActionRequestAdd      = "request.add"
+	ActionAuthLogin           = "auth.login"
+	ActionAuthLogout          = "auth.logout"
+	ActionRequestList         = "request.list"
+	ActionRequestRead         = "request.read"
+	ActionAuditRead           = "audit.read"
+	ActionDecisionList        = "decision.list"
+	ActionEvidenceRead        = "evidence.read"
+	ActionDecisionPrepare     = "decision.prepare"
+	ActionDecisionAdd         = "decision.add"
+	ActionRequestAdd          = "request.add"
+	ActionTransparencyPublish = "transparency.publish"
+	ActionSourceRecheck       = "source.recheck"
+	ActionSourceDeliver       = "source.deliver"
+	ActionRequestUpdate       = "request.update"
+	ActionEvidenceUpdate      = "evidence.update"
+	// Descriptive aliases retain a single persisted spelling while making the
+	// phase vocabulary explicit to callers and query clients.
+	ActionTransparencyPublication = ActionTransparencyPublish
+	ActionSourceDelivery          = ActionSourceDeliver
 )
 
 type ActorType string

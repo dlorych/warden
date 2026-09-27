@@ -141,6 +141,33 @@ The worker stores the published bundle and marks the request published before
 calling the source adapter's delivery callback. A delivery retry reuses that
 durable publication marker and does not submit another Rekor entry.
 
+Worker external lifecycles are audited under the fixed internal
+`warden-worker` service principal with the `worker` role. The worker sends
+each authorization request through the core default-deny Authorizer and
+retains its permission, policy version, and reason on the corresponding Audit
+Events. Rekor publication uses `transparency.publish`; source rechecks and
+delivery use `source.deliver`; request and evidence mutations are authorized
+with `request.update` and `evidence.update` respectively. A denied decision,
+or an unavailable Audit Log while recording that decision, prevents work.
+
+Before every Rekor Submit, source Recheck, and source Deliver invocation, a
+`started` Audit Event is committed. An observed terminal result appends a
+linked `success` or `failed` event. Started and terminal events for an attempt
+share a stable operation ID; retry attempts remain distinct events through
+their bounded metadata (logical operation ID plus job ID, attempt, and phase).
+A started-only operation is therefore queryable as indeterminate
+after a process interruption. Metadata never contains evidence, source
+context, tokens, callbacks, Rekor response data, or raw errors.
+
+When Warden controls the database mutation, verified publication plus its
+request/evidence state and the publication success event commit atomically.
+Delivery, cancellation, and expiry status changes commit atomically with
+their terminal events. Failure events are appended only after rolled-back
+mutations. If a terminal Audit Event cannot be appended, the mutation rolls
+back and the job remains retryable; if Rekor or a source has already accepted
+the request, the external-success/DB-failure window is represented by the
+started-only attempt and may cause a repeated external call on retry.
+
 The GitHub callback comment includes a stable public URL such as
 `https://warden.example/evidence/{request-id}`. The endpoint returns the exact
 immutable bundle only after Rekor inclusion has been verified; pending or

@@ -797,7 +797,7 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 	if q.Action != "" && !validAuditFilterValue(q.Action, 128) || q.ActorID != "" && !validAuditFilterValue(q.ActorID, 256) || q.ResourceType != "" && !validAuditFilterValue(q.ResourceType, 128) || q.ResourceID != "" && !validAuditFilterValue(q.ResourceID, 256) {
 		return audit.Query{}, fmt.Errorf("invalid audit filter")
 	}
-	if q.Action != "" && q.Action != audit.ActionAuthLogin && q.Action != audit.ActionAuthLogout && q.Action != audit.ActionRequestList && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionDecisionList && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != audit.ActionRequestAdd && q.Action != "audit.initialized" {
+	if q.Action != "" && !allowedAuditAction(q.Action) {
 		return audit.Query{}, fmt.Errorf("invalid audit action")
 	}
 	if raw := values.Get("limit"); raw != "" {
@@ -855,6 +855,20 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 		return audit.Query{}, fmt.Errorf("from must not be after to")
 	}
 	return q, nil
+}
+
+func allowedAuditAction(action string) bool {
+	switch action {
+	case audit.ActionAuthLogin, audit.ActionAuthLogout, audit.ActionRequestList,
+		audit.ActionRequestRead, audit.ActionAuditRead, audit.ActionDecisionList,
+		audit.ActionEvidenceRead, audit.ActionDecisionPrepare, audit.ActionDecisionAdd,
+		audit.ActionRequestAdd, audit.ActionTransparencyPublish, audit.ActionSourceRecheck,
+		audit.ActionSourceDeliver, audit.ActionRequestUpdate, audit.ActionEvidenceUpdate,
+		"audit.initialized":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) bffAudit(w http.ResponseWriter, r *http.Request) {

@@ -442,6 +442,10 @@ func (s *Store) ClaimJob(ctx context.Context) (Job, error) {
 	if e != nil {
 		return j, e
 	}
+	// The row returned above contains the previous attempt count. Expose the
+	// count for the attempt just claimed so worker audit metadata is stable and
+	// retries are distinguishable without another query.
+	j.Attempts++
 	return j, tx.Commit(ctx)
 }
 func (s *Store) FinishJob(ctx context.Context, id string, ok bool, errText string) error {
@@ -451,6 +455,29 @@ func (s *Store) FinishJob(ctx context.Context, id string, ok bool, errText strin
 	}
 	_, e := s.db.Exec(ctx, `UPDATE jobs SET status='pending',locked_at=NULL,run_after=now()+LEAST((2 ^ LEAST(attempts,8))*interval '1 minute',interval '1 hour'),last_error=$2 WHERE id=$1`, id, errText)
 	return e
+}
+
+// SetStatusesWithAudit commits a request status mutation and its terminal
+// worker Audit Event together. A failed append rolls back the status change.
+// Failure events for an external call are deliberately appended by the
+// worker after this method returns, outside this transaction.
+func (s *Store) SetStatusesWithAudit(ctx context.Context, id, logStatus, deliveryStatus string, terminalEvent audit.Event) error {
+	begin := s.beginDecisionTx
+	if begin == nil {
+		begin = func(ctx context.Context) (decisionTx, error) { return s.db.Begin(ctx) }
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `UPDATE requests SET log_status=COALESCE(NULLIF($2,''),log_status),delivery_status=COALESCE(NULLIF($3,''),delivery_status) WHERE id=$1`, id, logStatus, deliveryStatus); err != nil {
+		return err
+	}
+	if err = appendAuditEvent(ctx, tx, terminalEvent); err != nil {
+		return &AuditAppendError{Err: err}
+	}
+	return tx.Commit(ctx)
 }
 func (s *Store) SetStatuses(ctx context.Context, id, logStatus, deliveryStatus string) error {
 	_, e := s.db.Exec(ctx, `UPDATE requests SET log_status=COALESCE(NULLIF($2,''),log_status),delivery_status=COALESCE(NULLIF($3,''),delivery_status) WHERE id=$1`, id, logStatus, deliveryStatus)
@@ -471,6 +498,33 @@ func (s *Store) SavePublishedAndMark(ctx context.Context, requestID string, bund
 	}
 	if _, e = tx.Exec(ctx, `UPDATE requests SET log_status='published' WHERE id=$1`, requestID); e != nil {
 		return e
+	}
+	return tx.Commit(ctx)
+}
+
+// SavePublishedAndMarkWithAudit atomically stores the verified evidence,
+// marks the request transparently published, and appends the publication
+// terminal Audit Event. This is the database half of the unavoidable
+// external-success/DB-failure window: Rekor has already accepted the entry,
+// so a rollback leaves the started event queryable and the job retryable.
+func (s *Store) SavePublishedAndMarkWithAudit(ctx context.Context, requestID string, bundle []byte, terminalEvent audit.Event) error {
+	begin := s.beginDecisionTx
+	if begin == nil {
+		begin = func(ctx context.Context) (decisionTx, error) { return s.db.Begin(ctx) }
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `UPDATE decisions SET published_bundle=$2 WHERE request_id=$1`, requestID, bundle); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE requests SET log_status='published' WHERE id=$1`, requestID); err != nil {
+		return err
+	}
+	if err = appendAuditEvent(ctx, tx, terminalEvent); err != nil {
+		return &AuditAppendError{Err: err}
 	}
 	return tx.Commit(ctx)
 }
