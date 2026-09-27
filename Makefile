@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 COMPOSE := docker compose --env-file .dev/compose.env -f compose.yaml
 
-.PHONY: dev devinit up down logs demo-request test web-build cli-build config
+.PHONY: dev devinit up down logs demo-request test final-check web-build cli-build config
 
 devinit:
 	@./devinit
@@ -33,6 +33,9 @@ cli-build:
 test: devinit web-build
 	@go test ./...
 	@$(COMPOSE) config --quiet
+
+final-check:
+	@./dev/final-check.sh
 
 config: devinit
 	@$(COMPOSE) config

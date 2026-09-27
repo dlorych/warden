@@ -27,3 +27,13 @@ An identity authorized to prepare and add deployment decisions. A Reviewer is al
 **Action Code**:
 A stable name identifying the semantic action represented by an Audit Event.
 _Avoid_: Event type, operation name
+
+**Audit Event outcome**:
+The observed result of an attempted semantic action: `started`, `success`,
+`unauthenticated`, `denied`, `invalid`, or `failed`. A `started` event without
+a terminal event is an indeterminate external operation and remains queryable.
+
+**External lifecycle**:
+The worker phases that cross a Warden boundary: transparency publication,
+source recheck, and source delivery. Each phase has linked `started` and
+terminal Audit Events under its stable Action Code.

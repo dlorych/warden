@@ -26,4 +26,4 @@ elif grep -qE '^GITHUB_APP_(PRIVATE|PUBLIC)_KEY=' "$compose_env"; then
 fi
 echo "Warden development material is ready in .dev/"
 echo "Browser: http://localhost:8080   Keycloak: http://localhost:8180"
-echo "Users: requester/requester-dev-password, reviewer/reviewer-dev-password"
+echo "Users: requester/requester-dev-password, reviewer/reviewer-dev-password, auditor/auditor-dev-password"
