@@ -62,6 +62,15 @@ func New(db *pgxpool.Pool) *Store {
 	}
 }
 
+// beginAuthTx is kept as a seam for authentication lifecycle tests. The same
+// transaction shape is used by decision/challenge mutations.
+func (s *Store) beginAuthTx(ctx context.Context) (decisionTx, error) {
+	if s.beginDecisionTx != nil {
+		return s.beginDecisionTx(ctx)
+	}
+	return s.db.Begin(ctx)
+}
+
 // AppendAuditEvent is the only write operation exposed for Audit Events. The
 // database role and trigger enforce the same append-only guarantee below the
 // application boundary.
@@ -283,6 +292,55 @@ func (s *Store) CreateSession(ctx context.Context, subject, name, csrf string, r
 	_, e = s.db.Exec(ctx, `INSERT INTO sessions(id,subject,name,roles_json,csrf_hash,created_at,last_seen,expires_at) VALUES($1,$2,$3,$4,$5,$6,$6,$7)`, x.ID, x.Subject, x.Name, rolesJSON, x.CSRFHash, x.CreatedAt, x.ExpiresAt)
 	return x, e
 }
+
+// CreateSessionWithAudit commits a browser session and its authentication
+// event in one transaction. A session is never made usable when the event
+// cannot be appended.
+func (s *Store) CreateSessionWithAudit(ctx context.Context, subject, name, csrf string, roles []string, now time.Time, idle, absolute time.Duration, successEvent audit.Event) (Session, error) {
+	normalized := authz.NormalizeRoles(roles)
+	roleStrings := make([]string, len(normalized))
+	for i, role := range normalized {
+		roleStrings[i] = string(role)
+	}
+	x := Session{ID: uuid.NewString(), Subject: subject, Name: name, Roles: roleStrings, CSRFHash: hash(csrf), CreatedAt: now, LastSeen: now, ExpiresAt: now.Add(absolute)}
+	rolesJSON, err := json.Marshal(x.Roles)
+	if err != nil {
+		return x, err
+	}
+	tx, err := s.beginAuthTx(ctx)
+	if err != nil {
+		return x, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `INSERT INTO sessions(id,subject,name,roles_json,csrf_hash,created_at,last_seen,expires_at) VALUES($1,$2,$3,$4,$5,$6,$6,$7)`, x.ID, x.Subject, x.Name, rolesJSON, x.CSRFHash, x.CreatedAt, x.ExpiresAt); err != nil {
+		return x, err
+	}
+	if err = appendAuditEvent(ctx, tx, successEvent); err != nil {
+		return x, &AuditAppendError{Err: err}
+	}
+	return x, tx.Commit(ctx)
+}
+
+// DeleteSessionWithAudit commits local logout and its event together. The
+// caller must not expire the browser cookie until this method succeeds.
+func (s *Store) DeleteSessionWithAudit(ctx context.Context, id string, successEvent audit.Event) error {
+	tx, err := s.beginAuthTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return pgx.ErrNoRows
+	}
+	if err = appendAuditEvent(ctx, tx, successEvent); err != nil {
+		return &AuditAppendError{Err: err}
+	}
+	return tx.Commit(ctx)
+}
 func (s *Store) GetSession(ctx context.Context, id string, now time.Time, idle time.Duration) (Session, error) {
 	var x Session
 	var rolesJSON []byte
@@ -314,6 +372,24 @@ func (s *Store) CreateOAuthState(ctx context.Context, state, verifier, nonce, re
 	x := OAuthState{ID: uuid.NewString(), StateHash: hash(state), Verifier: verifier, Nonce: nonce, NonceHash: hash(nonce), RedirectURI: redirect, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute)}
 	_, e := s.db.Exec(ctx, `INSERT INTO oauth_states(id,state_hash,verifier,nonce_hash,redirect_uri,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, x.ID, x.StateHash, x.Verifier, x.NonceHash, x.RedirectURI, x.CreatedAt, x.ExpiresAt)
 	return x, e
+}
+
+// CreateOAuthStateWithAudit commits login state and the initiation event in one
+// transaction, so a redirect is never issued without a durable audit event.
+func (s *Store) CreateOAuthStateWithAudit(ctx context.Context, state, verifier, nonce, redirect string, now time.Time, startedEvent audit.Event) (OAuthState, error) {
+	x := OAuthState{ID: uuid.NewString(), StateHash: hash(state), Verifier: verifier, Nonce: nonce, NonceHash: hash(nonce), RedirectURI: redirect, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute)}
+	tx, err := s.beginAuthTx(ctx)
+	if err != nil {
+		return x, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `INSERT INTO oauth_states(id,state_hash,verifier,nonce_hash,redirect_uri,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, x.ID, x.StateHash, x.Verifier, x.NonceHash, x.RedirectURI, x.CreatedAt, x.ExpiresAt); err != nil {
+		return x, err
+	}
+	if err = appendAuditEvent(ctx, tx, startedEvent); err != nil {
+		return x, &AuditAppendError{Err: err}
+	}
+	return x, tx.Commit(ctx)
 }
 func (s *Store) ConsumeOAuthState(ctx context.Context, state string, now time.Time) (OAuthState, error) {
 	var x OAuthState

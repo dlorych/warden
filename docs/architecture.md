@@ -15,16 +15,29 @@ returns the current user and CSRF token. Browser reads such as
 give the browser an OIDC access token. Browser writes, including
 `/bff/logout`, require the session CSRF token and origin checks.
 
-The first audited protected read is the browser request-detail endpoint,
-`/bff/requests/{id}`, which appends immutable Audit Events under the stable
-`request.read` Action Code for successful, invalid, unauthenticated, denied,
-and failed outcomes. An Audit Event append failure returns `503` without the
-protected payload. The auditor-only `/bff/audit` endpoint uses the stable
-`audit.read` Action Code, bounded keyset pagination, and finite action,
-outcome, actor, resource, operation, and UTC time filters. Its own successful
-and unsuccessful reads are appended after selecting the result snapshot, so
-the event for a query appears only on the next query. Authentication, list,
-decision, evidence, and bearer-path auditing are deferred to later issues.
+Browser authentication and protected reads are audited at the BFF boundary.
+`/bff/login` records the redirect start and operational discovery or state
+failures; `/bff/callback` records the invalid, operational-failure, and success
+outcomes Warden observes; and `/bff/logout` records unauthenticated, denied,
+invalid, failed, and successful outcomes. Credential failures that occur
+entirely inside the IdP remain the IdP's responsibility. The protected browser
+list and detail reads for requests, the decision list, and protected evidence
+all append immutable Audit Events under their stable Action Codes, including
+missing or invalid sessions and authorization denials. Audit appends happen
+before a protected payload is returned; an append failure returns `503` and no
+protected payload (fail closed).
+
+The auditor-only `/bff/audit` endpoint uses the stable `audit.read` Action
+Code, bounded keyset pagination, and finite action, outcome, actor, resource,
+operation, and UTC time filters. Its own successful and unsuccessful reads are
+appended after selecting the result snapshot, so the event for a query appears
+only on the next query. The public `GET /evidence/{request-id}` path remains
+permission-free and unaudited; it exposes only an immutable bundle after
+publication.
+
+The browser polls only the active request list or request-detail view. Polling
+stops when that view is inactive or the document is hidden; the Audit Log is
+refreshed explicitly and never polls automatically.
 
 `GET /evidence/{request-id}` is a public, immutable read path for the
 published evidence bundle referenced by source callbacks. It is deliberately

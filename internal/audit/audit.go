@@ -13,8 +13,12 @@ const EventSchemaVersion = 1
 // these values stable: they are part of the Audit Log contract consumed by
 // operators and downstream evidence tooling.
 const (
+	ActionAuthLogin       = "auth.login"
+	ActionAuthLogout      = "auth.logout"
+	ActionRequestList     = "request.list"
 	ActionRequestRead     = "request.read"
 	ActionAuditRead       = "audit.read"
+	ActionDecisionList    = "decision.list"
 	ActionEvidenceRead    = "evidence.read"
 	ActionDecisionPrepare = "decision.prepare"
 	ActionDecisionAdd     = "decision.add"

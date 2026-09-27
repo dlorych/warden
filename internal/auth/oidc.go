@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/wardenv/service/internal/authz"
@@ -23,6 +24,37 @@ import (
 // Service owns the browser OIDC flow. It deliberately does not accept callback
 // URLs from requests: the configured redirect URI is persisted with each state.
 type Config struct{ OIDCIssuer, OIDCClientID, OIDCClientSecret, OIDCRedirectURL, OIDCAudience, OIDCInternalBaseURL string }
+
+// ExchangeFailureKind lets the BFF distinguish bad callback/token claims from
+// failures in the provider/network path. The distinction is deliberately
+// coarse and never exposes provider response bodies to callers or logs.
+type ExchangeFailureKind string
+
+const (
+	ExchangeInvalid ExchangeFailureKind = "invalid"
+	ExchangeFailed  ExchangeFailureKind = "failed"
+)
+
+type exchangeError struct {
+	kind ExchangeFailureKind
+	err  error
+}
+
+func (e *exchangeError) Error() string { return e.err.Error() }
+func (e *exchangeError) Unwrap() error { return e.err }
+
+// ClassifyExchangeFailure classifies an Exchange error for safe audit
+// outcomes. Unknown errors are treated as invalid because they originate in
+// token or claim verification unless explicitly marked as operational.
+func ClassifyExchangeFailure(err error) ExchangeFailureKind {
+	var classified *exchangeError
+	if errors.As(err, &classified) {
+		return classified.kind
+	}
+	return ExchangeInvalid
+}
+
+var errJWKSOperational = errors.New("oidc jwks operational failure")
 
 func hash(v string) string { h := sha256.Sum256([]byte(v)); return hex.EncodeToString(h[:]) }
 
@@ -137,7 +169,7 @@ func (s *Service) Exchange(ctx context.Context, code, verifier, nonceHash string
 	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {s.cfg.OIDCRedirectURL}, "client_id": {s.cfg.OIDCClientID}, "code_verifier": {verifier}}
 	req, e := http.NewRequestWithContext(ctx, http.MethodPost, s.transportURL(md.TokenEndpoint), strings.NewReader(form.Encode()))
 	if e != nil {
-		return Identity{}, e
+		return Identity{}, &exchangeError{kind: ExchangeFailed, err: e}
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if s.cfg.OIDCClientSecret != "" {
@@ -145,31 +177,50 @@ func (s *Service) Exchange(ctx context.Context, code, verifier, nonceHash string
 	}
 	res, e := s.client.Do(req)
 	if e != nil {
-		return Identity{}, e
+		return Identity{}, &exchangeError{kind: ExchangeFailed, err: e}
 	}
 	defer res.Body.Close()
 	if res.StatusCode/100 != 2 {
-		return Identity{}, fmt.Errorf("oidc token exchange: %s", res.Status)
+		kind := classifyTokenEndpointStatus(res.StatusCode)
+		return Identity{}, &exchangeError{kind: kind, err: fmt.Errorf("oidc token exchange: %s", res.Status)}
 	}
 	var tok struct {
 		IDToken     string `json:"id_token"`
 		AccessToken string `json:"access_token"`
 	}
 	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&tok); e != nil {
-		return Identity{}, e
+		return Identity{}, &exchangeError{kind: ExchangeFailed, err: e}
 	}
 	id, err := s.verify(tok.IDToken, nonceHash)
 	if err != nil {
-		return Identity{}, err
+		kind := ExchangeInvalid
+		if errors.Is(err, errJWKSOperational) {
+			kind = ExchangeFailed
+		}
+		return Identity{}, &exchangeError{kind: kind, err: err}
 	}
 	if tok.AccessToken != "" {
 		access, err := s.verifyAccessClaims(tok.AccessToken, false)
 		if err != nil {
-			return Identity{}, fmt.Errorf("invalid oidc access token: %w", err)
+			kind := ExchangeInvalid
+			if errors.Is(err, errJWKSOperational) {
+				kind = ExchangeFailed
+			}
+			return Identity{}, &exchangeError{kind: kind, err: fmt.Errorf("invalid oidc access token: %w", err)}
 		}
 		id.Roles = mergeRoles(id.Roles, access.Roles)
 	}
 	return id, nil
+}
+
+// classifyTokenEndpointStatus keeps provider availability and transient 4xx
+// failures retryable at the BFF boundary. The statuses conventionally used
+// for rejected authorization codes or client credentials remain invalid.
+func classifyTokenEndpointStatus(status int) ExchangeFailureKind {
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return ExchangeInvalid
+	}
+	return ExchangeFailed
 }
 
 type claims struct {
@@ -300,13 +351,16 @@ func (s *Service) key(kid string) (*rsa.PublicKey, error) {
 	md := s.metadata()
 	req, e := http.NewRequest(http.MethodGet, s.transportURL(md.JWKSURI), nil)
 	if e != nil {
-		return nil, e
+		return nil, fmt.Errorf("%w: %v", errJWKSOperational, e)
 	}
 	res, e := s.client.Do(req)
 	if e != nil {
-		return nil, e
+		return nil, fmt.Errorf("%w: %v", errJWKSOperational, e)
 	}
 	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("%w: jwks endpoint returned %s", errJWKSOperational, res.Status)
+	}
 	var set struct {
 		Keys []struct {
 			Kid string `json:"kid"`
@@ -318,7 +372,7 @@ func (s *Service) key(kid string) (*rsa.PublicKey, error) {
 		} `json:"keys"`
 	}
 	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&set); e != nil {
-		return nil, e
+		return nil, fmt.Errorf("%w: %v", errJWKSOperational, e)
 	}
 	for _, j := range set.Keys {
 		if j.Kty != "RSA" || j.Use != "sig" && j.Use != "" || j.Alg != "RS256" && j.Alg != "" {

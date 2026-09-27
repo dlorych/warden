@@ -110,10 +110,35 @@ func prepareAuditEvent(r *http.Request, event audit.Event, status int) audit.Eve
 	event.IPAddress = clientIP(r)
 	event.UserAgent = truncateUserAgent(r.UserAgent(), 512)
 	event.Route = r.URL.Path
-	if event.Metadata == nil {
-		event.Metadata = json.RawMessage(fmt.Sprintf(`{"http_status":%d}`, status))
-	}
+	event.Metadata = safeAuditMetadata(event.Metadata, status)
 	return event
+}
+
+// safeAuditMetadata is intentionally a tiny allowlist. Audit events may carry
+// bounded operational counters, but never request bodies, credentials, or
+// provider protocol values.
+func safeAuditMetadata(raw json.RawMessage, status int) json.RawMessage {
+	allowed := map[string]any{"http_status": status}
+	var input map[string]json.RawMessage
+	if json.Unmarshal(raw, &input) == nil {
+		for _, key := range []string{"returned", "decision"} {
+			if value, ok := input[key]; ok {
+				if key == "returned" {
+					var n int
+					if json.Unmarshal(value, &n) == nil && n >= 0 && n <= 100 {
+						allowed[key] = n
+					}
+				} else {
+					var decision string
+					if json.Unmarshal(value, &decision) == nil && (decision == "approved" || decision == "rejected") {
+						allowed[key] = decision
+					}
+				}
+			}
+		}
+	}
+	b, _ := json.Marshal(allowed)
+	return b
 }
 
 func (a *App) logAuditFailure(event audit.Event, err error) {
@@ -157,7 +182,6 @@ func readAuditEvent(actor audit.Event, outcome audit.Outcome, reason, resourceID
 func authAuditEvent(actor audit.Event, action string, outcome audit.Outcome, reason string) audit.Event {
 	actor.ActionCode = action
 	actor.Outcome = outcome
-	actor.PolicyVersion = authz.PolicyVersion
 	actor.Reason = reason
 	return actor
 }
@@ -178,7 +202,7 @@ func decisionListAuditEvent(actor audit.Event, outcome audit.Outcome, reason str
 	actor.Permission = string(authz.DecisionRead)
 	actor.PolicyVersion = authz.PolicyVersion
 	actor.Reason = reason
-	actor.ResourceType = "decision"
+	actor.ResourceType = "deployment_decision"
 	return actor
 }
 
@@ -188,7 +212,7 @@ func evidenceAuditEvent(actor audit.Event, outcome audit.Outcome, reason, resour
 	actor.Permission = string(authz.EvidenceRead)
 	actor.PolicyVersion = authz.PolicyVersion
 	actor.Reason = reason
-	actor.ResourceType = "deployment_request"
+	actor.ResourceType = "protected_evidence"
 	actor.ResourceID = resourceID
 	return actor
 }
@@ -198,6 +222,14 @@ func browserActor(r *http.Request, s store.Session, authenticated bool) audit.Ev
 		return auditActor(s.Subject, s.Name, s.Roles, audit.ActorUser)
 	}
 	return auditActor("", "", nil, audit.ActorAnonymous)
+}
+
+func safeResourceID(raw string) string {
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return id.String()
 }
 
 // operationForState gives initiation and callback the same correlation UUID
@@ -229,42 +261,118 @@ func (a *App) sessionCookieName() string {
 	return "warden_session"
 }
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
+	actor := auditActor("", "", nil, audit.ActorAnonymous)
+	actor.AuthMethod = "oidc"
 	if a.Auth == nil {
-		writeProblem(w, 503, "OIDC unavailable")
+		if a.failAudit(w, r, authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeFailed, "oidc_unavailable"), http.StatusServiceUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "OIDC unavailable")
+		}
 		return
 	}
 	if e := a.Auth.Discovery(r.Context()); e != nil {
-		writeProblem(w, 503, "OIDC unavailable")
+		if a.failAudit(w, r, authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeFailed, "oidc_discovery_failed"), http.StatusServiceUnavailable) {
+			writeProblem(w, http.StatusServiceUnavailable, "OIDC unavailable")
+		}
 		return
 	}
 	state, verifier, nonce := randomToken(32), randomToken(32), randomToken(32)
-	if _, e := a.Store.CreateOAuthState(r.Context(), state, verifier, nonce, a.Config.OIDCRedirectURL, time.Now()); e != nil {
-		writeProblem(w, 500, "Could not create login transaction")
+	operationID := operationForState(state)
+	started := preparedAuditEvent(r, authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeStarted, "redirect"), http.StatusFound)
+	started.OperationID = operationID
+	if _, e := a.Store.CreateOAuthStateWithAudit(r.Context(), state, verifier, nonce, a.Config.OIDCRedirectURL, time.Now(), started); e != nil {
+		if auditPersistenceFailure(e) {
+			a.logAuditFailure(started, e)
+			writeProblem(w, http.StatusServiceUnavailable, "Audit service unavailable")
+			return
+		}
+		failed := authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeFailed, "login_state_creation_failed")
+		failed.OperationID = operationID
+		if !a.failAudit(w, r, failed, http.StatusInternalServerError) {
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, "Could not create login transaction")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "warden_login", Value: state, Path: "/bff", HttpOnly: true, Secure: a.Config.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.Redirect(w, r, a.Auth.AuthorizationURL(state, verifier, nonce), http.StatusFound)
 }
+
+func classifyOIDCCallbackFailure(service *auth.Service, exchangeErr error) (audit.Outcome, string, int, string) {
+	if service == nil {
+		return audit.OutcomeFailed, "oidc_unavailable", http.StatusServiceUnavailable, "OIDC unavailable"
+	}
+	if auth.ClassifyExchangeFailure(exchangeErr) == auth.ExchangeFailed {
+		return audit.OutcomeFailed, "oidc_exchange_failed", http.StatusServiceUnavailable, "OIDC authentication unavailable"
+	}
+	return audit.OutcomeInvalid, "oidc_token_invalid", http.StatusUnauthorized, "OIDC authentication failed"
+}
+
 func (a *App) callback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+	operationID := ""
+	if state != "" {
+		operationID = operationForState(state)
+	}
+	actor := auditActor("", "", nil, audit.ActorAnonymous)
+	actor.AuthMethod = "oidc"
+	callbackOutcome := func(outcome audit.Outcome, reason string, status int, title string) {
+		event := authAuditEvent(actor, audit.ActionAuthLogin, outcome, reason)
+		event.OperationID = operationID
+		if !a.failAudit(w, r, event, status) {
+			return
+		}
+		writeProblem(w, status, title)
+	}
+	invalid := func(reason string, status int, title string) {
+		callbackOutcome(audit.OutcomeInvalid, reason, status, title)
+	}
 	lc, e := r.Cookie("warden_login")
-	if e != nil || r.URL.Query().Get("state") == "" || lc.Value != r.URL.Query().Get("state") {
-		writeProblem(w, 400, "Invalid login transaction")
+	if e != nil || state == "" || lc.Value != state {
+		invalid("login_state_invalid", http.StatusBadRequest, "Invalid login transaction")
 		return
 	}
-	st, e := a.Store.ConsumeOAuthState(r.Context(), r.URL.Query().Get("state"), time.Now())
+	st, e := a.Store.ConsumeOAuthState(r.Context(), state, time.Now())
 	if e != nil {
-		writeProblem(w, 400, "Invalid login transaction")
+		if errors.Is(e, pgx.ErrNoRows) {
+			invalid("login_state_invalid", http.StatusBadRequest, "Invalid login transaction")
+		} else {
+			callbackOutcome(audit.OutcomeFailed, "login_state_consume_failed", http.StatusInternalServerError, "Could not validate login transaction")
+		}
+		return
+	}
+	if strings.TrimSpace(r.URL.Query().Get("code")) == "" {
+		invalid("code_missing", http.StatusBadRequest, "Invalid login transaction")
+		return
+	}
+	if a.Auth == nil {
+		outcome, reason, status, title := classifyOIDCCallbackFailure(a.Auth, nil)
+		callbackOutcome(outcome, reason, status, title)
 		return
 	}
 	id, e := a.Auth.Exchange(r.Context(), r.URL.Query().Get("code"), st.Verifier, st.NonceHash)
 	if e != nil {
-		writeProblem(w, 401, "OIDC authentication failed")
+		outcome, reason, status, title := classifyOIDCCallbackFailure(a.Auth, e)
+		callbackOutcome(outcome, reason, status, title)
 		return
 	}
+	actor = auditActor(id.Subject, id.Name, id.Roles, audit.ActorUser)
+	actor.AuthMethod = "oidc"
 	csrf := randomToken(32)
-	sess, e := a.Store.CreateSession(r.Context(), id.Subject, id.Name, csrf, id.Roles, time.Now(), a.Config.SessionIdle, a.Config.SessionAbsolute)
+	success := preparedAuditEvent(r, authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeSuccess, "session_created"), http.StatusFound)
+	success.OperationID = operationID
+	sess, e := a.Store.CreateSessionWithAudit(r.Context(), id.Subject, id.Name, csrf, id.Roles, time.Now(), a.Config.SessionIdle, a.Config.SessionAbsolute, success)
 	if e != nil {
-		writeProblem(w, 500, "Could not create session")
+		if auditPersistenceFailure(e) {
+			a.logAuditFailure(success, e)
+			writeProblem(w, http.StatusServiceUnavailable, "Audit service unavailable")
+			return
+		}
+		failed := authAuditEvent(actor, audit.ActionAuthLogin, audit.OutcomeFailed, "session_creation_failed")
+		failed.OperationID = operationID
+		if !a.failAudit(w, r, failed, http.StatusInternalServerError) {
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, "Could not create session")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: a.sessionCookieName(), Value: sess.ID, Path: "/", HttpOnly: true, Secure: a.Config.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: int(a.Config.SessionAbsolute.Seconds())})
@@ -272,11 +380,46 @@ func (a *App) callback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, a.Config.WebURL, http.StatusFound)
 }
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireBrowser(w, r); !ok {
+	actor := auditActor("", "", nil, audit.ActorAnonymous)
+	actor.AuthMethod = "cookie"
+	s, err := a.currentSession(r)
+	if err != nil {
+		event := authAuditEvent(actor, audit.ActionAuthLogout, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r))
+		if a.failAudit(w, r, event, http.StatusUnauthorized) {
+			writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		}
 		return
 	}
-	if c, e := r.Cookie(a.sessionCookieName()); e == nil {
-		_ = a.Store.DeleteSession(r.Context(), c.Value)
+	actor = auditActor(s.Subject, s.Name, s.Roles, audit.ActorUser)
+	actor.AuthMethod = "cookie"
+	if origin := strings.TrimRight(r.Header.Get("Origin"), "/"); origin == "" || (origin != strings.TrimRight(a.Config.WebURL, "/") && origin != strings.TrimRight(a.Config.PublicURL, "/")) {
+		event := authAuditEvent(actor, audit.ActionAuthLogout, audit.OutcomeDenied, "origin_invalid")
+		if a.failAudit(w, r, event, http.StatusForbidden) {
+			writeProblem(w, http.StatusForbidden, "Origin validation failed")
+		}
+		return
+	}
+	if token := r.Header.Get("X-CSRF-Token"); token == "" || token != s.CSRFHash {
+		event := authAuditEvent(actor, audit.ActionAuthLogout, audit.OutcomeInvalid, "csrf_invalid")
+		if a.failAudit(w, r, event, http.StatusForbidden) {
+			writeProblem(w, http.StatusForbidden, "CSRF validation failed")
+		}
+		return
+	}
+	success := preparedAuditEvent(r, authAuditEvent(actor, audit.ActionAuthLogout, audit.OutcomeSuccess, "session_deleted"), http.StatusOK)
+	c, _ := r.Cookie(a.sessionCookieName())
+	if err = a.Store.DeleteSessionWithAudit(r.Context(), c.Value, success); err != nil {
+		if auditPersistenceFailure(err) {
+			a.logAuditFailure(success, err)
+			writeProblem(w, http.StatusServiceUnavailable, "Audit service unavailable")
+			return
+		}
+		failed := authAuditEvent(actor, audit.ActionAuthLogout, audit.OutcomeFailed, "session_deletion_failed")
+		if !a.failAudit(w, r, failed, http.StatusInternalServerError) {
+			return
+		}
+		writeProblem(w, http.StatusInternalServerError, "Could not log out")
+		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: a.sessionCookieName(), Value: "", Path: "/", HttpOnly: true, Secure: a.Config.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	// Local invalidation is complete before constructing the provider redirect.
@@ -362,9 +505,10 @@ func browserDTO(x store.Request) browserRequestDTO {
 }
 
 // authorizeAuditedRequestRead is the authentication and authorization boundary
-// for the first request-detail tracer. Other protected browser reads retain the
-// issue-#2 behavior and are intentionally not audited until later tickets.
+// for browser request-detail reads. It preserves existence hiding while making
+// every attempted request.read observable before a protected response.
 func (a *App) authorizeAuditedRequestRead(w http.ResponseWriter, r *http.Request, resourceID string) (store.Session, audit.Event, bool) {
+	resourceID = safeResourceID(resourceID)
 	s, err := a.currentSession(r)
 	actor := auditActor("", "", nil, audit.ActorAnonymous)
 	actor.AuthMethod = "cookie"
@@ -391,9 +535,19 @@ func (a *App) authorizeAuditedRequestRead(w http.ResponseWriter, r *http.Request
 }
 
 func (a *App) bffRequests(w http.ResponseWriter, r *http.Request) {
-	s, ok := a.requireBrowser(w, r)
-	if !ok || !a.allows(s.Roles, s.Subject, authz.RequestRead, authz.Resource{}) {
-		if ok {
+	actor := browserActor(r, store.Session{}, false)
+	actor.AuthMethod = "cookie"
+	s, err := a.currentSession(r)
+	if err != nil {
+		if a.failAudit(w, r, requestListAuditEvent(actor, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r)), http.StatusUnauthorized) {
+			writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		}
+		return
+	}
+	actor = browserActor(r, s, true)
+	actor.AuthMethod = "cookie"
+	if decision := a.authorize(s.Roles, s.Subject, authz.RequestRead, authz.Resource{}); !decision.Allowed {
+		if a.failAudit(w, r, requestListAuditEvent(actor, audit.OutcomeDenied, decision.Reason), http.StatusForbidden) {
 			writeProblem(w, http.StatusForbidden, "Permission denied")
 		}
 		return
@@ -401,29 +555,39 @@ func (a *App) bffRequests(w http.ResponseWriter, r *http.Request) {
 	cursor := r.URL.Query().Get("cursor")
 	if cursor != "" {
 		if _, e := uuid.Parse(cursor); e != nil {
-			writeProblem(w, 400, "Invalid cursor")
+			if a.failAudit(w, r, requestListAuditEvent(actor, audit.OutcomeInvalid, "cursor_invalid"), http.StatusBadRequest) {
+				writeProblem(w, http.StatusBadRequest, "Invalid cursor")
+			}
 			return
 		}
 	}
 	items, next, e := a.Store.ListRequests(r.Context(), cursor, 50)
 	if e != nil {
-		writeProblem(w, 500, "Could not list requests")
+		if a.failAudit(w, r, requestListAuditEvent(actor, audit.OutcomeFailed, "request_list_failed"), http.StatusInternalServerError) {
+			writeProblem(w, http.StatusInternalServerError, "Could not list requests")
+		}
 		return
 	}
 	out := make([]browserRequestDTO, len(items))
 	for i := range items {
 		out[i] = browserDTO(items[i])
 	}
+	success := requestListAuditEvent(actor, audit.OutcomeSuccess, "list")
+	success.Metadata = json.RawMessage(fmt.Sprintf(`{"returned":%d}`, len(out)))
+	if !a.failAudit(w, r, success, http.StatusOK) {
+		return
+	}
 	writeJSON(w, 200, map[string]any{"items": out, "nextCursor": next})
 }
 func (a *App) bffRequest(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	resourceID := safeResourceID(id)
 	_, eventActor, ok := a.authorizeAuditedRequestRead(w, r, id)
 	if !ok {
 		return
 	}
 	if _, e := uuid.Parse(id); e != nil {
-		event := readAuditEvent(eventActor, audit.OutcomeInvalid, "request_id_invalid", id)
+		event := readAuditEvent(eventActor, audit.OutcomeInvalid, "request_id_invalid", resourceID)
 		if !a.failAudit(w, r, event, http.StatusNotFound) {
 			return
 		}
@@ -432,18 +596,22 @@ func (a *App) bffRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	x, e := a.Store.GetRequest(r.Context(), id)
 	if e != nil {
-		outcome, reason := audit.OutcomeInvalid, "request_not_found"
+		outcome, reason, status := audit.OutcomeInvalid, "request_not_found", http.StatusNotFound
 		if !errors.Is(e, pgx.ErrNoRows) {
-			outcome, reason = audit.OutcomeFailed, "request_read_failed"
+			outcome, reason, status = audit.OutcomeFailed, "request_read_failed", http.StatusInternalServerError
 		}
-		event := readAuditEvent(eventActor, outcome, reason, id)
-		if !a.failAudit(w, r, event, http.StatusNotFound) {
+		event := readAuditEvent(eventActor, outcome, reason, resourceID)
+		if !a.failAudit(w, r, event, status) {
 			return
 		}
-		writeProblem(w, 404, "Request not found")
+		if status == http.StatusNotFound {
+			writeProblem(w, http.StatusNotFound, "Request not found")
+		} else {
+			writeProblem(w, status, "Could not read request")
+		}
 		return
 	}
-	event := readAuditEvent(eventActor, audit.OutcomeSuccess, "read", id)
+	event := readAuditEvent(eventActor, audit.OutcomeSuccess, "read", resourceID)
 	if !a.failAudit(w, r, event, http.StatusOK) {
 		return
 	}
@@ -451,20 +619,52 @@ func (a *App) bffRequest(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) bffEvidence(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	s, ok := a.requireBrowser(w, r)
-	if !ok || !a.allows(s.Roles, s.Subject, authz.EvidenceRead, authz.Resource{RequestID: id}) {
-		if ok {
+	resourceID := safeResourceID(id)
+	actor := browserActor(r, store.Session{}, false)
+	actor.AuthMethod = "cookie"
+	s, err := a.currentSession(r)
+	if err != nil {
+		if a.failAudit(w, r, evidenceAuditEvent(actor, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r), resourceID), http.StatusUnauthorized) {
+			writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		}
+		return
+	}
+	actor = browserActor(r, s, true)
+	actor.AuthMethod = "cookie"
+	if decision := a.authorize(s.Roles, s.Subject, authz.EvidenceRead, authz.Resource{RequestID: id}); !decision.Allowed {
+		if a.failAudit(w, r, evidenceAuditEvent(actor, audit.OutcomeDenied, decision.Reason, resourceID), http.StatusNotFound) {
 			writeProblem(w, http.StatusNotFound, "Evidence not found")
 		}
 		return
 	}
 	if _, e := uuid.Parse(id); e != nil {
-		writeProblem(w, http.StatusNotFound, "Evidence not found")
+		if a.failAudit(w, r, evidenceAuditEvent(actor, audit.OutcomeInvalid, "request_id_invalid", resourceID), http.StatusNotFound) {
+			writeProblem(w, http.StatusNotFound, "Evidence not found")
+		}
+		return
+	}
+	if _, e := a.Store.GetRequest(r.Context(), id); e != nil {
+		outcome, reason, status := audit.OutcomeInvalid, "request_not_found", http.StatusNotFound
+		if !errors.Is(e, pgx.ErrNoRows) {
+			outcome, reason, status = audit.OutcomeFailed, "evidence_request_lookup_failed", http.StatusInternalServerError
+		}
+		if a.failAudit(w, r, evidenceAuditEvent(actor, outcome, reason, resourceID), status) {
+			if status == http.StatusNotFound {
+				writeProblem(w, status, "Evidence not found")
+			} else {
+				writeProblem(w, status, "Could not read evidence")
+			}
+		}
 		return
 	}
 	d, e := a.Store.RequestEvidence(r.Context(), id)
 	if e != nil {
-		writeProblem(w, 500, "Could not read evidence")
+		if a.failAudit(w, r, evidenceAuditEvent(actor, audit.OutcomeFailed, "evidence_read_failed", resourceID), http.StatusInternalServerError) {
+			writeProblem(w, http.StatusInternalServerError, "Could not read evidence")
+		}
+		return
+	}
+	if !a.failAudit(w, r, evidenceAuditEvent(actor, audit.OutcomeSuccess, "read", resourceID), http.StatusOK) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"items": d})
@@ -507,9 +707,19 @@ type decisionDTO struct {
 }
 
 func (a *App) bffDecisions(w http.ResponseWriter, r *http.Request) {
-	s, ok := a.requireBrowser(w, r)
-	if !ok || !a.allows(s.Roles, s.Subject, authz.DecisionRead, authz.Resource{}) {
-		if ok {
+	actor := browserActor(r, store.Session{}, false)
+	actor.AuthMethod = "cookie"
+	s, err := a.currentSession(r)
+	if err != nil {
+		if a.failAudit(w, r, decisionListAuditEvent(actor, audit.OutcomeUnauthenticated, a.browserSessionFailureReason(r)), http.StatusUnauthorized) {
+			writeProblem(w, http.StatusUnauthorized, "Authentication required")
+		}
+		return
+	}
+	actor = browserActor(r, s, true)
+	actor.AuthMethod = "cookie"
+	if decision := a.authorize(s.Roles, s.Subject, authz.DecisionRead, authz.Resource{}); !decision.Allowed {
+		if a.failAudit(w, r, decisionListAuditEvent(actor, audit.OutcomeDenied, decision.Reason), http.StatusForbidden) {
 			writeProblem(w, http.StatusForbidden, "Permission denied")
 		}
 		return
@@ -517,18 +727,27 @@ func (a *App) bffDecisions(w http.ResponseWriter, r *http.Request) {
 	cursor := r.URL.Query().Get("cursor")
 	if cursor != "" {
 		if _, e := uuid.Parse(cursor); e != nil {
-			writeProblem(w, 400, "Invalid cursor")
+			if a.failAudit(w, r, decisionListAuditEvent(actor, audit.OutcomeInvalid, "cursor_invalid"), http.StatusBadRequest) {
+				writeProblem(w, http.StatusBadRequest, "Invalid cursor")
+			}
 			return
 		}
 	}
 	items, next, e := a.Store.ListDecisions(r.Context(), cursor, 50)
 	if e != nil {
-		writeProblem(w, 500, "Could not list decisions")
+		if a.failAudit(w, r, decisionListAuditEvent(actor, audit.OutcomeFailed, "decision_list_failed"), http.StatusInternalServerError) {
+			writeProblem(w, http.StatusInternalServerError, "Could not list decisions")
+		}
 		return
 	}
 	out := make([]decisionDTO, len(items))
 	for i, x := range items {
 		out[i] = decisionDTO{ID: x.ID, RequestID: x.RequestID, Reviewer: x.ReviewerName, Decision: x.Decision, Reason: x.Reason, CreatedAt: x.CreatedAt, Statement: x.Statement, Signature: x.Signature}
+	}
+	success := decisionListAuditEvent(actor, audit.OutcomeSuccess, "list")
+	success.Metadata = json.RawMessage(fmt.Sprintf(`{"returned":%d}`, len(out)))
+	if !a.failAudit(w, r, success, http.StatusOK) {
+		return
 	}
 	writeJSON(w, 200, map[string]any{"items": out, "nextCursor": next})
 }
@@ -566,7 +785,7 @@ func parseAuditQuery(values url.Values) (audit.Query, error) {
 	if q.Action != "" && !validAuditFilterValue(q.Action, 128) || q.ActorID != "" && !validAuditFilterValue(q.ActorID, 256) || q.ResourceType != "" && !validAuditFilterValue(q.ResourceType, 128) || q.ResourceID != "" && !validAuditFilterValue(q.ResourceID, 256) {
 		return audit.Query{}, fmt.Errorf("invalid audit filter")
 	}
-	if q.Action != "" && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != "audit.initialized" {
+	if q.Action != "" && q.Action != audit.ActionAuthLogin && q.Action != audit.ActionAuthLogout && q.Action != audit.ActionRequestList && q.Action != audit.ActionRequestRead && q.Action != audit.ActionAuditRead && q.Action != audit.ActionDecisionList && q.Action != audit.ActionEvidenceRead && q.Action != audit.ActionDecisionPrepare && q.Action != audit.ActionDecisionAdd && q.Action != "audit.initialized" {
 		return audit.Query{}, fmt.Errorf("invalid audit action")
 	}
 	if raw := values.Get("limit"); raw != "" {
@@ -788,6 +1007,12 @@ func cliAction(permission authz.Permission) string {
 }
 
 func cliAuditEvent(id *auth.Identity, permission authz.Permission, outcome audit.Outcome, reason, resourceID string) audit.Event {
+	resourceType := "deployment_request"
+	if permission == authz.EvidenceRead {
+		resourceType = "protected_evidence"
+	} else if permission == authz.DecisionPrepare || permission == authz.DecisionAdd || permission == authz.DecisionRead {
+		resourceType = "deployment_decision"
+	}
 	event := audit.Event{
 		ActionCode:    cliAction(permission),
 		Outcome:       outcome,
@@ -795,7 +1020,7 @@ func cliAuditEvent(id *auth.Identity, permission authz.Permission, outcome audit
 		Permission:    string(permission),
 		PolicyVersion: authz.PolicyVersion,
 		Reason:        reason,
-		ResourceType:  "deployment_request",
+		ResourceType:  resourceType,
 		ResourceID:    resourceID,
 		ActorType:     audit.ActorAnonymous,
 	}

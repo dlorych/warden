@@ -1,12 +1,57 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 )
+
+func TestClassifyExchangeFailureDistinguishesInvalidAndOperational(t *testing.T) {
+	if got := ClassifyExchangeFailure(&exchangeError{kind: ExchangeInvalid, err: errJWKSOperational}); got != ExchangeInvalid {
+		t.Fatalf("invalid classification = %q", got)
+	}
+	if got := ClassifyExchangeFailure(&exchangeError{kind: ExchangeFailed, err: errJWKSOperational}); got != ExchangeFailed {
+		t.Fatalf("operational classification = %q", got)
+	}
+}
+
+func TestExchangeClassifiesTokenAndProviderFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+		want ExchangeFailureKind
+	}{
+		{name: "malformed token", code: http.StatusOK, body: `{"id_token":"not-a-jwt"}`, want: ExchangeInvalid},
+		{name: "invalid authorization code", code: http.StatusBadRequest, body: `{}`, want: ExchangeInvalid},
+		{name: "invalid client", code: http.StatusUnauthorized, body: `{}`, want: ExchangeInvalid},
+		{name: "provider endpoint unavailable", code: http.StatusNotFound, body: `{}`, want: ExchangeFailed},
+		{name: "provider request timeout", code: http.StatusRequestTimeout, body: `{}`, want: ExchangeFailed},
+		{name: "provider throttling", code: http.StatusTooManyRequests, body: `{}`, want: ExchangeFailed},
+		{name: "provider outage", code: http.StatusBadGateway, body: `{}`, want: ExchangeFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/token" {
+					http.NotFound(w, r)
+					return
+				}
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			s := New(Config{OIDCIssuer: "http://issuer.invalid", OIDCClientID: "warden-bff", OIDCRedirectURL: "http://localhost/callback"})
+			s.meta.TokenEndpoint = server.URL + "/token"
+			_, err := s.Exchange(context.Background(), "code", "verifier", "nonce")
+			if err == nil || ClassifyExchangeFailure(err) != tc.want {
+				t.Fatalf("error=%v classification=%q want %q", err, ClassifyExchangeFailure(err), tc.want)
+			}
+		})
+	}
+}
 
 func TestNormalizedRolesDropsUnknownAndDuplicates(t *testing.T) {
 	got := normalizedRoles([]string{"reviewer", "unknown", " reader ", "reviewer", "AUDITOR"})
